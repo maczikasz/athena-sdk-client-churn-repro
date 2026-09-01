@@ -76,3 +76,14 @@ application {
 tasks.named('run') {
     dependsOn(downloadAthenaJdbc)
 }
+
+// Scenarios 3 and 4 run against a local mock Athena HTTP server and need real wall-clock time
+// (Hikari timeouts, pool recovery). They run in their own JVM, separate from the 'run' task
+// (scenarios 1-2), so pool/thread state from one run can never contaminate another.
+tasks.register('runProductionTimeout', JavaExec) {
+    dependsOn(downloadAthenaJdbc)
+    group = 'verification'
+    description = 'Scenario 3+4: churn under a slow/failing mock Athena endpoint, and pool recovery.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.example.athenachurn.ProductionTimeoutRepro'
+}
