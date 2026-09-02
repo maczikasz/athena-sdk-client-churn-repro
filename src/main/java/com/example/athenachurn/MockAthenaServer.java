@@ -53,6 +53,12 @@ final class MockAthenaServer implements AutoCloseable {
      * Credential= component) is accepted; every other key gets a 403 UnrecognizedClientException,
      * exactly like a rotated or disabled real AWS credential would. */
     private volatile String acceptedAccessKeyId = null;
+    /** One-shot: the next request whose X-Amz-Target ends with this string never gets a
+     * response at all (no headers, nothing) - the TCP connection is just held open. Consumed
+     * atomically so exactly one matching request hangs. */
+    private final java.util.concurrent.atomic.AtomicReference<String> hangOnceTarget =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    private static final long HANG_MAX_MILLIS = 180_000;
 
     private MockAthenaServer(HttpsServer server) {
         this.server = server;
@@ -65,7 +71,7 @@ final class MockAthenaServer implements AutoCloseable {
         server.setHttpsConfigurator(new HttpsConfigurator(sslContext));
         MockAthenaServer mock = new MockAthenaServer(server);
         server.createContext("/", mock::handle);
-        server.setExecutor(Executors.newCachedThreadPool());
+        server.setExecutor(Executors.newCachedThreadPool(MockAthenaServer::newDaemonThread));
         server.start();
         return mock;
     }
@@ -93,6 +99,19 @@ final class MockAthenaServer implements AutoCloseable {
     /** Restricts accepted requests to this access key ID, or pass {@code null} to accept any. */
     void setAcceptedAccessKeyId(String accessKeyId) {
         this.acceptedAccessKeyId = accessKeyId;
+    }
+
+    /**
+     * Arms a one-shot hang: the next request whose {@code X-Amz-Target} ends with
+     * {@code targetSuffix} gets no response at all - not even headers - and the handler thread
+     * just parks, holding the TCP connection open, for up to {@link #HANG_MAX_MILLIS}. Exactly
+     * one request is hung; every other request (before or after) is answered normally. This is
+     * deliberately different from high latency: latency still completes and answers, a hang
+     * never sends a single response byte, so it exercises the client's own dead-peer detection
+     * (or the total absence of it) instead of a slow-but-working endpoint.
+     */
+    void armHangOnce(String targetSuffix) {
+        hangOnceTarget.set(targetSuffix);
     }
 
     /** Extracts the access key ID from a SigV4 {@code Authorization} header, or null if absent. */
@@ -135,6 +154,23 @@ final class MockAthenaServer implements AutoCloseable {
         String body = new String(bodyBytes, StandardCharsets.UTF_8);
         String key = target == null ? "S3:" + exchange.getRequestURI() : target;
         callCounts.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();
+
+        String armedHang = hangOnceTarget.get();
+        if (target != null && armedHang != null && target.endsWith(armedHang)
+                && hangOnceTarget.compareAndSet(armedHang, null)) {
+            if (verbose) {
+                System.out.println("[mock] HANGING on " + key + " (no response will ever be sent)");
+            }
+            try {
+                Thread.sleep(HANG_MAX_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            // Deliberately return without ever calling sendResponseHeaders: the client gets
+            // nothing, ever, from this request - not even a connection-level error - until its
+            // own client-side timeout (if any) gives up on it.
+            return;
+        }
 
         long delay = latencyMillis.get();
         if (delay > 0) {
@@ -243,6 +279,12 @@ final class MockAthenaServer implements AutoCloseable {
         SSLContext sslContext = SSLContext.getInstance("TLS");
         sslContext.init(kmf.getKeyManagers(), null, null);
         return sslContext;
+    }
+
+    private static Thread newDaemonThread(Runnable r) {
+        Thread t = new Thread(r);
+        t.setDaemon(true);
+        return t;
     }
 
     private static void run(String... command) throws IOException, InterruptedException {

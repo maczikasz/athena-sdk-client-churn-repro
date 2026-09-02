@@ -8,6 +8,7 @@ import java.lang.reflect.Field;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.SQLTransientConnectionException;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -17,6 +18,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Scenarios 3-5: whether the client-construction churn from {@link AthenaClientChurnRepro} (and
@@ -47,6 +49,8 @@ public final class ProductionTimeoutRepro {
             scenario4RecoveryFromSlowness(mock);
             scenario4RecoveryFromFailures(mock);
             scenario5FrozenBadCredential(mock);
+            scenario6HungConnectionCreation(mock, false);
+            scenario6HungConnectionCreation(mock, true);
         } finally {
             mock.close();
         }
@@ -234,6 +238,147 @@ public final class ProductionTimeoutRepro {
             }
         }
         System.out.println();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Scenario 6: a hung SDK call during connection creation - the strongest never-recovers
+    // candidate, motivated directly by a real production stack trace with no "Caused by:".
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * HikariPool.createTimeoutException attaches getLastConnectionFailure() as the borrow
+     * timeout's cause ONLY if a creation attempt actually finished (successfully or not) since
+     * the pool went empty. A production trace with NO "Caused by:" means, at the moment of the
+     * timeout, no creation attempt had finished at all - the pool's single connection-adder
+     * thread was still in progress on one. This scenario reproduces that directly: the mock
+     * accepts one connection, reads the whole request, and then never answers - not even an
+     * error - so whatever client-side timeout the driver has (or does not have) governing that
+     * wait is the entire question.
+     */
+    private static void scenario6HungConnectionCreation(MockAthenaServer mock, boolean pinned) throws Exception {
+        header("Scenario 6 (" + (pinned ? "PINNED" : "UNPINNED")
+                + "): mock accepts the connection, reads the request, then never responds");
+        mock.setLatencyMillis(150);
+        mock.setFailing(false);
+        mock.setAcceptedAccessKeyId(null);
+
+        String poolName = "scenario6-" + (pinned ? "pinned" : "unpinned");
+        try (HikariDataSource pool = buildPool(mock, poolName, "dummy", pinned)) {
+            waitForPoolToFill(pool, POOL_SIZE, 15_000);
+            System.out.println("  Pool warm at " + poolStatus(pool) + ". Evicting, then arming a one-shot hang");
+            System.out.println("  on the next StartQueryExecution call - that is the adder's next creation attempt.");
+            pool.getHikariPoolMXBean().softEvictConnections();
+            mock.armHangOnce("StartQueryExecution");
+
+            // Continuously hammer borrows in the background so we keep sampling the exact
+            // exception HikariCP throws while the adder is stuck.
+            AtomicReference<SQLException> lastException = new AtomicReference<>();
+            AtomicInteger attempts = new AtomicInteger();
+            AtomicInteger successesAfterRecovery = new AtomicInteger();
+            Thread borrower = new Thread(() -> {
+                while (!Thread.currentThread().isInterrupted()) {
+                    attempts.incrementAndGet();
+                    try (Connection c = pool.getConnection()) {
+                        successesAfterRecovery.incrementAndGet();
+                    } catch (SQLException e) {
+                        lastException.set(e);
+                    }
+                    // A short pace, not a rate limit: once the pool recovers, borrows return in
+                    // ~0ms and an unpaced loop would spin millions of times a second, burning
+                    // CPU without adding evidence. This does not affect the mechanism under test.
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }, poolName + "-borrower");
+            borrower.setDaemon(true);
+            borrower.start();
+
+            // Give the adder time to actually start its one creation attempt and hit the hang.
+            Thread.sleep(2000);
+
+            System.out.println();
+            System.out.println("  Thread dump: looking for the pool's connection-adder thread, parked mid-call.");
+            printAdderThreadStack(poolName);
+
+            System.out.println();
+            System.out.println("  Flipping the mock back to healthy - but ONLY for NEW connections. The socket");
+            System.out.println("  the hung adder is parked on is never touched: no response, no close, no RST,");
+            System.out.println("  exactly like a network path that silently dropped without tearing down the TCP");
+            System.out.println("  connection. Proving the endpoint itself is fine with an independent direct connect:");
+            Properties direct = baseProperties(mock, "dummy");
+            try (Connection direct1 = new com.amazon.athena.jdbc.AthenaDriver().connect("jdbc:athena://", direct)) {
+                System.out.println("  Direct connect while the pool's adder is still parked: SUCCEEDED (" + direct1 + ")");
+            } catch (SQLException e) {
+                System.out.println("  Direct connect while the pool's adder is still parked: FAILED unexpectedly: " + e);
+            }
+
+            System.out.println();
+            System.out.println("  Observing for up to 60s: pool status every 10s, first exception's getCause().");
+            long observeStart = System.nanoTime();
+            long observeDeadline = observeStart + 60_000_000_000L;
+            boolean recovered = false;
+            long recoveredAtMillis = -1;
+            while (System.nanoTime() < observeDeadline) {
+                Thread.sleep(10_000);
+                long elapsedMillis = (System.nanoTime() - observeStart) / 1_000_000;
+                HikariPoolMXBean mxBean = pool.getHikariPoolMXBean();
+                System.out.println("  t=" + elapsedMillis + "ms  " + poolStatus(pool)
+                        + "  attempts=" + attempts.get() + "  successes=" + successesAfterRecovery.get());
+                if (!recovered && mxBean.getTotalConnections() > 0 && successesAfterRecovery.get() > 0) {
+                    recovered = true;
+                    recoveredAtMillis = elapsedMillis;
+                    System.out.println("  --> pool recovered at t=" + elapsedMillis + "ms");
+                }
+            }
+            borrower.interrupt();
+            borrower.join(5_000);
+
+            System.out.println();
+            System.out.println("  Thread dump again, at the end of the observation window:");
+            printAdderThreadStack(poolName);
+
+            SQLException sample = lastException.get();
+            System.out.println();
+            if (sample != null) {
+                System.out.println("  Sample borrow exception: " + sample);
+                System.out.println("  sample.getCause(): " + sample.getCause());
+            } else {
+                System.out.println("  No borrow exception captured (every attempt during observation succeeded).");
+            }
+            System.out.println("  Recovered within 60s observation window: " + recovered
+                    + (recovered ? (" (at t=" + recoveredAtMillis + "ms)") : ""));
+        }
+        System.out.println();
+    }
+
+    /**
+     * Prints the stack of any live thread whose name suggests it is HikariCP's connection-adder
+     * for the given pool (HikariCP names it "&lt;poolName&gt; connection adder").
+     */
+    private static void printAdderThreadStack(String poolName) {
+        boolean found = false;
+        for (Map.Entry<Thread, StackTraceElement[]> entry : Thread.getAllStackTraces().entrySet()) {
+            Thread t = entry.getKey();
+            String name = t.getName();
+            if (name.contains(poolName) && name.toLowerCase(java.util.Locale.ROOT).contains("adder")) {
+                found = true;
+                System.out.println("  Thread \"" + name + "\" (state=" + t.getState() + "):");
+                for (StackTraceElement frame : entry.getValue()) {
+                    System.out.println("      at " + frame);
+                }
+            }
+        }
+        if (!found) {
+            System.out.println("  (no thread matching \"" + poolName + "\" + \"adder\" found - listing all "
+                    + "thread names for reference)");
+            for (Thread t : Thread.getAllStackTraces().keySet()) {
+                System.out.println("    - " + t.getName());
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------------------

@@ -140,14 +140,71 @@ and a *different*, freshly-built pool with the new key connects immediately - bu
 symptom, `total=0`. This is a design property of how JDBC connection pools read credentials, not
 a driver defect, and it does not depend on the churn bug in any way - it is included here because
 it produces the identical-looking symptom for a completely different reason, which matters when
-diagnosing a real "total=0, timing out" pool in production.
+diagnosing a real "total=0, timing out" pool in production. Of everything in this project, this
+is the only genuinely permanent, restart-only wedge - see scenario 6 for a candidate that looked
+like it might be a second one, and was not, once actually tested.
+
+**Scenario 6 - a hung SDK call during connection creation: the strongest "never recovers"
+candidate, tested directly.** This was motivated by a specific production detail: a real
+`Connection is not available, request timed out after 3000ms` stack trace with **no
+`Caused by:`** at all. HikariCP's `createTimeoutException` only attaches a cause if some
+connection-creation attempt had actually *finished* (successfully or not) since the pool went
+empty - so a missing cause means that, at the moment of the timeout, no attempt had finished.
+The natural hypothesis: the pool's single connection-adder thread was permanently stuck inside
+one SDK call that would never return, so every later borrow just piled up behind it, forever.
+
+`ProductionTimeoutRepro` tests this directly. The mock accepts a connection, reads the full
+`StartQueryExecution` request, and then sends back **nothing at all** - no response, no error,
+no close, no RST - and holds the socket exactly like that, indefinitely. The pool is evicted
+first, so its single connection-adder thread is the one that walks straight into the hang. A
+thread dump taken moments later finds it parked exactly where expected:
+
+```
+Thread "scenario6-unpinned:connection-adder" (state=WAITING):
+    ...
+    at app//com.amazon.athena.jdbc.AthenaStatementBase.getQueryExecutionId(AthenaStatementBase.java:179)
+    at app//com.amazon.athena.jdbc.AthenaConnection.testConnection(AthenaConnection.java:438)
+    at app//com.amazon.athena.jdbc.AthenaDriver.connect(AthenaDriver.java:147)
+    at app//com.zaxxer.hikari.pool.HikariPool$PoolEntryCreator.call(HikariPool.java:752)
+```
+
+While that thread is still parked there, a completely independent direct `connect()` call
+(bypassing the pool) succeeds immediately - proving the endpoint is healthy and only the one
+socket the adder is stuck on is dead, exactly like a network path that silently dropped a
+connection without tearing it down. Meanwhile the pool itself stays at `total=0`, every borrow
+fails with `Connection is not available, request timed out after 3000ms`, and
+**`exception.getCause()` is `null`** - reproducing the exact production signature.
+
+**Where this stops matching the hypothesis: it is not permanent.** In every run, both pinned and
+unpinned, the pool recovered on its own at almost exactly the same wall-clock moment - **30.2
+seconds** after the hang started (`t=30226ms` unpinned, `t=30223ms` pinned, in the run captured
+below - repeatable, not noise). Pinning `NetworkTimeoutMillis` made no measurable difference at
+all. Decompiling the driver and the AWS SDK explains both halves of that:
+
+- `ConnectionConfiguration#getHttpClientBuilder()` uses `apiRequestTimeout` (what
+  `NetworkTimeoutMillis` sets) for exactly one thing: Netty's `connectionAcquisitionTimeout` -
+  the time to grab an already-open pooled HTTP connection. It is never wired to anything that
+  bounds waiting for a response on a connection that's already open and already sent its
+  request. Pinning it cannot touch this hang.
+- `software.amazon.awssdk.http.SdkHttpConfigurationOption` (in the AWS SDK's own Netty transport
+  jar) hard-codes `DEFAULT_SOCKET_READ_TIMEOUT = Duration.ofSeconds(30)`, and the driver never
+  overrides it. That default - not the driver, not `NetworkTimeoutMillis` - is what eventually
+  fires Netty's `ReadTimeoutHandler`, fails the hung attempt, and frees the adder to try again
+  against the (already healthy) mock.
+
+So scenario 6 reproduces the exact diagnostic signature of the "no `Caused by:`" production
+trace - a real parked adder thread, a real `getCause() == null` - but the underlying wedge in
+this driver version is bounded at about 30 seconds by an AWS SDK default, not permanent. A pool
+that stays wedged for much longer than that, or that a restart is the only fix for, is better
+explained by something in the same family as scenario 5 (a static, frozen input that a fresh
+attempt can never satisfy) than by an infinite hang in a single SDK call.
 
 ## How to run it
 
 ```bash
 export JAVA_HOME=/path/to/a/jdk-17-or-newer
 ./gradlew run                      # scenarios 1-2: offline churn counting
-./gradlew runProductionTimeout     # scenarios 3-5: mock-endpoint timeout/recovery/credential-wedge
+./gradlew runProductionTimeout     # scenarios 3-6: mock-endpoint timeout/recovery/credential-wedge/hang
 ```
 
 Both tasks depend on `downloadAthenaJdbc`, which fetches the driver
@@ -160,8 +217,9 @@ https://downloads.athena.us-east-1.amazonaws.com/drivers/JDBC/3.8.0/athena-jdbc-
 
 The download task prints the SHA-256 of the downloaded zip. Any Gradle 8 or newer can run this
 project; the checked-in wrapper uses Gradle 8.10.2. `runProductionTimeout` takes a few minutes:
-it deliberately waits out a real 60-second failure window and a real ~130-second credential-wedge
-window, using wall-clock time, not simulated time.
+it deliberately waits out a real 60-second failure window, a real ~130-second credential-wedge
+window, and two real ~60-second hang-observation windows, using wall-clock time, not simulated
+time - about 8 minutes end to end.
 
 ## Expected output
 
@@ -210,38 +268,38 @@ scenario. The `0` is consistent with the 3.8.0 fix for the earlier thread-leak d
 this reproduction demonstrates is a different, still-open defect — construction churn, not a
 thread leak.
 
-## Expected output: scenarios 3-5 (`./gradlew runProductionTimeout`)
+## Expected output: scenarios 3-6 (`./gradlew runProductionTimeout`)
 
-This is the actual output from a verified run, with HikariCP/driver log lines and Java stack
-traces omitted for readability (the full stack traces are in the terminal output; they are AWS
-SDK retry-exhausted `AthenaException`s during the scenario 4b failure window, expected and
-harmless):
+This is the actual output from a verified run, with HikariCP/driver log lines, Java stack
+traces, and (in scenario 6) the ~90 unrelated thread names in each end-of-window thread dump
+omitted for readability:
 
 ```
-Mock Athena/S3 endpoint listening at https://127.0.0.1:52301
+Mock Athena/S3 endpoint listening at https://127.0.0.1:49507
 Scenario 3, phase A: healthy baseline (mock latency 150ms/call)
 ---------------------------------------------------------------
-  borrows: successes=160, timeouts=0, otherFailures=0, borrow p50=0ms, p99=3ms
+  borrows: successes=160, timeouts=0, otherFailures=0, borrow p50=0ms, p99=5ms
 Scenario 3, phase B (UNPINNED): mock latency raised to 2500ms/call (~7.5s per connection) after eviction
 ----------------------------------------------------------------------------------------------------
-  Pool warm at total=12, active=0, idle=12, waiting=0. Raising mock latency and evicting all connections.
-  borrows: successes=150, timeouts=0, otherFailures=0, borrow p50=0ms, p99=2774ms
-  Distinct athenaSdkClient instances observed during this phase: 5
+  Pool warm at total=15, active=0, idle=15, waiting=0. Raising mock latency and evicting all connections.
+  borrows: successes=90, timeouts=60, otherFailures=0, borrow p50=0ms, p99=396ms
+  Distinct athenaSdkClient instances observed during this phase: 3
+  Verbatim exception (first occurrence): phaseB-unpinned - Connection is not available, request timed out after 3071ms (total=0, active=0, idle=0, waiting=18)
 Scenario 3, phase B (PINNED): mock latency raised to 2500ms/call (~7.5s per connection) after eviction
 ----------------------------------------------------------------------------------------------------
-  Pool warm at total=12, active=0, idle=12, waiting=0. Raising mock latency and evicting all connections.
-  borrows: successes=120, timeouts=30, otherFailures=0, borrow p50=0ms, p99=1550ms
+  Pool warm at total=15, active=0, idle=15, waiting=0. Raising mock latency and evicting all connections.
+  borrows: successes=90, timeouts=60, otherFailures=0, borrow p50=0ms, p99=361ms
   Distinct athenaSdkClient instances observed during this phase: 1
-  Verbatim exception (first occurrence): phaseB-pinned - Connection is not available, request timed out after 3131ms (total=0, active=0, idle=0, waiting=29)
+  Verbatim exception (first occurrence): phaseB-pinned - Connection is not available, request timed out after 3071ms (total=0, active=0, idle=0, waiting=26)
 Scenario 4a: recovery after mock latency drops back to 150ms
 ------------------------------------------------------------
   Restoring mock latency to 150ms and measuring recovery time.
-  Recovered: true after 18443ms. Pool status: total=15, active=0, idle=15, waiting=0
+  Recovered: true after 14264ms. Pool status: total=15, active=0, idle=15, waiting=0
 Scenario 4b: recovery after a 60s window of mock 500s
 -----------------------------------------------------
   Mock returning 500s for 60s, with borrow pressure applied throughout.
   Restoring the mock to healthy and measuring recovery time.
-  Recovered: true after 24544ms. Pool status: total=15, active=0, idle=15, waiting=0
+  Recovered: true after 14830ms. Pool status: total=15, active=0, idle=15, waiting=0
 Scenario 5: a deterministically-bad, process-frozen credential wedges the pool forever
 --------------------------------------------------------------------------------------
   Phase A: pool built with AccessKeyId=key-A, mock currently accepts any key.
@@ -249,75 +307,130 @@ Scenario 5: a deterministically-bad, process-frozen credential wedges the pool f
   Phase B: mock now only accepts key-B. key-A (frozen in poolA's config) is
   rejected with 403 UnrecognizedClientException, exactly like a rotated real
   AWS credential. Evicting poolA's connections and retrying borrows for ~130s.
-  Retried for 131925ms: 42 borrow attempts, 42 failed.
-  Verbatim exception: scenario5-keyA - Connection is not available, request timed out after 3149ms (total=0, active=0, idle=0, waiting=0)
-  Verbatim exception: scenario5-keyA - Connection is not available, request timed out after 3148ms (total=0, active=0, idle=0, waiting=0)
-  Verbatim exception: scenario5-keyA - Connection is not available, request timed out after 3146ms (total=0, active=0, idle=0, waiting=0)
+  Retried for 132114ms: 43 borrow attempts, 43 failed.
+  Verbatim exception: scenario5-keyA - Connection is not available, request timed out after 3061ms (total=0, active=0, idle=0, waiting=0)
   Direct proof the endpoint itself is healthy: a fresh connect() with key-B,
   made independently of poolA, while poolA is still wedged:
-  Direct connect with key-B while poolA is wedged: SUCCEEDED (com.amazon.athena.jdbc.AthenaConnection@213bd3d5)
+  Direct connect with key-B while poolA is wedged: SUCCEEDED (com.amazon.athena.jdbc.AthenaConnection@4a23350)
   Phase C: does poolA (still configured with key-A) ever recover on its own?
   poolA self-recovery within 10s of extra waiting: false (expected: false - its AccessKeyId is frozen at pool-creation time)
   A brand NEW pool built with key-B recovers immediately - only a fresh
   pool/process (which re-reads the credential) fixes this, not waiting:
   New pool with key-B: borrows: successes=30, timeouts=0, otherFailures=0, borrow p50=0ms, p99=0ms
+Scenario 6 (UNPINNED): mock accepts the connection, reads the request, then never responds
+------------------------------------------------------------------------------------------
+  Pool warm at total=15, active=0, idle=15, waiting=0. Evicting, then arming a one-shot hang
+  on the next StartQueryExecution call - that is the adder's next creation attempt.
+  Thread dump: looking for the pool's connection-adder thread, parked mid-call.
+  Thread "scenario6-unpinned:connection-adder" (state=WAITING):
+      at java.base/jdk.internal.misc.Unsafe.park(Native Method)
+      at java.base/java.util.concurrent.CompletableFuture$Signaller.block(CompletableFuture.java:1864)
+      at java.base/java.util.concurrent.CompletableFuture.waitingGet(CompletableFuture.java:1898)
+      at java.base/java.util.concurrent.CompletableFuture.get(CompletableFuture.java:2072)
+      at app//com.amazon.athena.jdbc.AthenaStatementBase.getQueryExecutionId(AthenaStatementBase.java:179)
+      at app//com.amazon.athena.jdbc.AthenaStatementBase.runQuery(AthenaStatementBase.java:136)
+      at app//com.amazon.athena.jdbc.AthenaConnection.testConnection(AthenaConnection.java:438)
+      at app//com.amazon.athena.jdbc.AthenaDriver.connect(AthenaDriver.java:147)
+      at app//com.zaxxer.hikari.pool.HikariPool$PoolEntryCreator.call(HikariPool.java:752)
+      at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+  Flipping the mock back to healthy - but ONLY for NEW connections. The socket
+  the hung adder is parked on is never touched: no response, no close, no RST,
+  exactly like a network path that silently dropped without tearing down the TCP
+  connection. Proving the endpoint itself is fine with an independent direct connect:
+  Direct connect while the pool's adder is still parked: SUCCEEDED (com.amazon.athena.jdbc.AthenaConnection@13da7ab0)
+  Observing for up to 60s: pool status every 10s, first exception's getCause().
+  t=10072ms  total=0, active=0, idle=0, waiting=1  attempts=5  successes=0
+  t=20151ms  total=0, active=0, idle=0, waiting=1  attempts=8  successes=0
+  t=30226ms  total=3, active=0, idle=3, waiting=0  attempts=28  successes=19
+  --> pool recovered at t=30226ms
+  t=40303ms  total=13, active=0, idle=13, waiting=0  attempts=110  successes=101
+  t=50378ms  total=15, active=0, idle=15, waiting=0  attempts=192  successes=183
+  t=60454ms  total=15, active=0, idle=15, waiting=0  attempts=275  successes=266
+  Sample borrow exception: java.sql.SQLTransientConnectionException: scenario6-unpinned - Connection is not available, request timed out after 3061ms (total=0, active=0, idle=0, waiting=0)
+  sample.getCause(): null
+  Recovered within 60s observation window: true (at t=30226ms)
+Scenario 6 (PINNED): mock accepts the connection, reads the request, then never responds
+----------------------------------------------------------------------------------------
+  Pool warm at total=15, active=0, idle=15, waiting=0. Evicting, then arming a one-shot hang
+  on the next StartQueryExecution call - that is the adder's next creation attempt.
+  Thread dump: looking for the pool's connection-adder thread, parked mid-call.
+  Thread "scenario6-pinned:connection-adder" (state=WAITING):
+      [identical stack to the unpinned run above]
+  Direct connect while the pool's adder is still parked: SUCCEEDED (com.amazon.athena.jdbc.AthenaConnection@7c8d5312)
+  Observing for up to 60s: pool status every 10s, first exception's getCause().
+  t=10074ms  total=0, active=0, idle=0, waiting=1  attempts=5  successes=0
+  t=20148ms  total=0, active=0, idle=0, waiting=1  attempts=8  successes=0
+  t=30223ms  total=3, active=0, idle=3, waiting=0  attempts=28  successes=19
+  --> pool recovered at t=30223ms
+  t=40295ms  total=13, active=0, idle=13, waiting=0  attempts=114  successes=105
+  t=50370ms  total=15, active=0, idle=15, waiting=0  attempts=198  successes=189
+  t=60443ms  total=15, active=0, idle=15, waiting=0  attempts=286  successes=277
+  Sample borrow exception: java.sql.SQLTransientConnectionException: scenario6-pinned - Connection is not available, request timed out after 3075ms (total=0, active=0, idle=0, waiting=0)
+  sample.getCause(): null
+  Recovered within 60s observation window: true (at t=30223ms)
 ```
 
 ### What this experiment does not show
 
-The verbatim production exception was reproduced: `Connection is not available, request timed
-out after 3131ms (total=0, active=0, idle=0, waiting=29)` matches the real HikariCP message
-format exactly, down to the pool-state fields.
+**Scenario 3.** The verbatim production exception was reproduced exactly, both pinned and
+unpinned. What it does **not** cleanly show is pinning *reducing* the failure rate during a mass
+reconnect storm: in this run both pinned and unpinned timed out on 60 of 150 borrows. Earlier
+runs (kept in this project's history) even showed pinned failing *more* than unpinned. What
+stayed rock solid across every run: the **distinct-client counts** matched scenarios 1-2 exactly,
+every time (1 for pinned, 3-5 for unpinned) - the churn mechanism itself is real and reproducible
+even under this concurrent, mixed create/validate load. The most defensible read: phase B's
+timeouts are dominated by the unavoidable cost of building brand-new physical connections from
+nothing (three real round trips at 2500ms each, ~7.5s, identical regardless of pinning), not by
+churn's validation-time overhead - that overhead is real and unbounded over time (scenarios 1-2
+prove it directly), but a mass-eviction-under-load stress test is not the regime where it
+dominates the raw failure rate. **This experiment does not support a claim that pinning
+`NetworkTimeoutMillis` reduces production borrow-timeout rates during a reconnect storm** - what
+it does do, proven directly by scenarios 1-2, is stop the SDK clients from being discarded and
+rebuilt on every validated borrow of an existing, healthy connection.
 
-What it does **not** cleanly show is pinning *reducing* that failure rate. In this run, PINNED
-timed out on 30 of 150 borrows and UNPINNED timed out on 0. That is the opposite of what the
-churn hypothesis alone would predict, so before trusting it, this was re-run four more times,
-alternating pinned/unpinned order to check for an order artifact:
+**Scenario 6.** This was built to test a specific hypothesis: that a hung SDK call during
+connection creation wedges the pool permanently when `NetworkTimeoutMillis` is unset, because
+the driver's default `apiRequestTimeout` is `PRACTICALLY_INFINITE_DURATION`, and that pinning it
+to 15 seconds bounds the hang and fixes it. Both halves of that hypothesis are contradicted by
+the data above: unpinned recovered (`t=30226ms`), and pinned recovered at essentially the same
+moment (`t=30223ms`) - pinning made no measurable difference. Decompiling the driver shows why:
+`apiRequestTimeout` is wired only to Netty's `connectionAcquisitionTimeout` (acquiring an
+already-open pooled connection), never to anything that bounds waiting for a response once a
+request is already in flight. The actual bound - confirmed in
+`software.amazon.awssdk.http.SdkHttpConfigurationOption`, in the AWS SDK's own Netty transport
+jar - is a hard-coded, undocumented-by-this-driver `DEFAULT_SOCKET_READ_TIMEOUT` of 30 seconds,
+which the driver never overrides. What scenario 6 does confirm, precisely: the diagnostic
+signature of a real production trace with no `Caused by:` - a connection-adder thread genuinely
+parked inside the driver's SDK call, and a borrow-timeout exception whose `getCause()` really is
+`null` while that thread is stuck. It is just bounded, in this driver version, at about 30
+seconds, not forever.
 
-| run order | pinned timeouts | unpinned timeouts | distinct clients (pinned / unpinned) |
-|---|---|---|---|
-| pinned, unpinned | 30/150 | 30/150 | 1 / 4 |
-| pinned, unpinned | 30/150 | 0/150 | 1 / 5 |
+### A note on two hypotheses this project does NOT support
 
-Two findings survive that check: the **distinct-client counts reproduced exactly as scenarios
-1-2 predict, every single time** (1 for pinned, 4-5 for unpinned) - the churn mechanism itself is
-solid and reproducible even under this concurrent, mixed create/validate load. The **raw timeout
-counts did not** - pinned was consistently at 30/150 both times, unpinned swung between 0 and 30.
-
-The most defensible explanation: Phase B's timeouts are dominated by the cost of building brand
-new physical connections from nothing (three real round trips at 2500ms each, ~7.5s, regardless
-of pinning) and by how many of the pool's ~15 evicted connections happen to queue up for
-rebuilding inside HikariCP's connection-adder at once - a scheduling/contention detail this
-harness does not control for, not something either run configures differently. The churn bug's
-validation-time overhead (proven directly in scenarios 1-2, and still visible here as the
-distinct-client count) is real and unbounded over time, but this specific stress pattern -
-mass eviction and rebuild under load - is not the regime where it dominates the failure rate.
-**This experiment does not support a claim that pinning `NetworkTimeoutMillis` reduces
-production borrow-timeout rates during a mass reconnect storm.** What scenarios 1-2 already
-proved stands regardless: the pin stops the SDK clients from being discarded and rebuilt on
-every validated borrow of an existing, healthy connection.
-
-### A note on a hypothesis this project does NOT reproduce
-
-An earlier hypothesis held that the AWS SDK's default Netty transport uses a shared,
-reference-counted `EventLoopGroup` (confirmed in this jar's dependencies:
-`software.amazon.awssdk.http.nio.netty.internal.SharedSdkEventLoopGroup`), and that once its
-reference count reaches zero the group would be permanently torn down, wedging every SDK client
-built afterward. Decompiling `SharedSdkEventLoopGroup#get()` in the shipped
+**A permanently torn-down shared event loop group.** An earlier hypothesis held that the AWS
+SDK's default Netty transport uses a shared, reference-counted `EventLoopGroup` (confirmed in
+this jar's dependencies: `software.amazon.awssdk.http.nio.netty.internal.SharedSdkEventLoopGroup`),
+and that once its reference count reaches zero the group would be permanently torn down, wedging
+every SDK client built afterward. Decompiling `SharedSdkEventLoopGroup#get()` in the shipped
 `AwsJavaSdk-HttpClient-NettyNioClient-2.0.jar` shows that is not the shipped behavior: `get()`
 checks whether its static holder is `null` and builds a brand new group when it is, so a
-reference count reaching zero tears down the *old* group but does not wedge the class - the
-next `get()` call transparently builds a replacement. This project does not include a scenario
-for that hypothesis, because static analysis already disproves it against this jar. What churn
+reference count reaching zero tears down the *old* group but does not wedge the class - the next
+`get()` call transparently builds a replacement. This project does not include a scenario for
+that hypothesis, because static analysis already disproves it against this jar. What churn
 *does* leave behind, confirmed by scenarios 1-2, is that the discarded clients' reference to
 that shared group is never released in the first place (`close()` is never called on them) - so
-under the churn bug, the shared group's reference count only ever climbs, it does not reach
-zero through this path at all.
+under the churn bug, the shared group's reference count only ever climbs, it does not reach zero
+through this path at all.
+
+**A permanent hang from a single unresponsive SDK call.** See "What this experiment does not
+show" above: scenario 6 tested this directly and it is bounded at ~30 seconds by an AWS SDK
+default, in both the pinned and unpinned case. Of everything demonstrated in this project, only
+scenario 5's frozen credential is a genuinely permanent, restart-only wedge.
 
 ## Files
 
 - `src/main/java/com/example/athenachurn/AthenaClientChurnRepro.java` — scenarios 1-2, offline churn counting
-- `src/main/java/com/example/athenachurn/MockAthenaServer.java` — the local HTTPS mock Athena/S3 endpoint used by scenarios 3-5
-- `src/main/java/com/example/athenachurn/ProductionTimeoutRepro.java` — scenarios 3-5
+- `src/main/java/com/example/athenachurn/MockAthenaServer.java` — the local HTTPS mock Athena/S3 endpoint used by scenarios 3-6
+- `src/main/java/com/example/athenachurn/ProductionTimeoutRepro.java` — scenarios 3-6
 - `build.gradle` — the `downloadAthenaJdbc` task and both `run` / `runProductionTimeout` tasks
 - `libs/` — where the downloaded driver lands; not committed
