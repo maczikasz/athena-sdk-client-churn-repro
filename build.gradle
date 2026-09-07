@@ -65,25 +65,38 @@ compileJava.dependsOn(downloadAthenaJdbc)
 // transitive AWS SDK v2 / Netty jar it needs, unshaded, under runtime-dependencies/.
 dependencies {
     implementation fileTree(dir: "libs/athena-jdbc-${athenaJdbcVersion}", include: ['*.jar', 'runtime-dependencies/*.jar'])
-    implementation 'com.zaxxer:HikariCP:7.0.2'
+    implementation 'com.zaxxer:HikariCP:7.1.0'
     implementation 'org.slf4j:slf4j-simple:2.0.16'
 }
 
 application {
-    mainClass = 'com.example.athenachurn.AthenaClientChurnRepro'
+    mainClass = 'com.example.athenachurn.StreamingResponseStallRepro'
 }
 
 tasks.named('run') {
     dependsOn(downloadAthenaJdbc)
 }
 
-// Scenarios 3 and 4 run against a local mock Athena HTTP server and need real wall-clock time
-// (Hikari timeouts, pool recovery). They run in their own JVM, separate from the 'run' task
-// (scenarios 1-2), so pool/thread state from one run can never contaminate another.
-tasks.register('runProductionTimeout', JavaExec) {
-    dependsOn(downloadAthenaJdbc)
-    group = 'verification'
-    description = 'Scenario 3+4: churn under a slow/failing mock Athena endpoint, and pool recovery.'
+tasks.register('runResultFetcherWorkaround', JavaExec) {
+    description = 'Runs the ResultFetcher=GetQueryResults workaround scenario (Workaround A).'
+    group = 'application'
     classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'com.example.athenachurn.ProductionTimeoutRepro'
+    mainClass = 'com.example.athenachurn.ResultFetcherWorkaroundRepro'
+    dependsOn(downloadAthenaJdbc)
+}
+
+tasks.register('runReflectionExecutorHop', JavaExec) {
+    description = 'Runs the reflection executor-hop workaround scenario (Workaround B).'
+    group = 'application'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.example.athenachurn.ReflectionExecutorHopRepro'
+    dependsOn(downloadAthenaJdbc)
+}
+
+tasks.register('runChurn', JavaExec) {
+    description = 'Runs the offline SDK client construction churn reproduction (Finding 2).'
+    group = 'application'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.example.athenachurn.AthenaClientChurnRepro'
+    dependsOn(downloadAthenaJdbc)
 }
