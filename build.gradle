@@ -70,7 +70,7 @@ dependencies {
 }
 
 application {
-    mainClass = 'com.example.athenachurn.StreamingResponseStallRepro'
+    mainClass = 'com.example.athenachurn.streaming.StreamingResponseStallRepro'
 }
 
 tasks.named('run') {
@@ -81,7 +81,7 @@ tasks.register('runResultFetcherWorkaround', JavaExec) {
     description = 'Runs the ResultFetcher=GetQueryResults workaround scenario (Workaround A).'
     group = 'application'
     classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'com.example.athenachurn.ResultFetcherWorkaroundRepro'
+    mainClass = 'com.example.athenachurn.streaming.ResultFetcherWorkaroundRepro'
     dependsOn(downloadAthenaJdbc)
 }
 
@@ -89,7 +89,7 @@ tasks.register('runReflectionExecutorHop', JavaExec) {
     description = 'Runs the reflection executor-hop workaround scenario (Workaround B).'
     group = 'application'
     classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'com.example.athenachurn.ReflectionExecutorHopRepro'
+    mainClass = 'com.example.athenachurn.streaming.ReflectionExecutorHopRepro'
     dependsOn(downloadAthenaJdbc)
 }
 
@@ -97,6 +97,6 @@ tasks.register('runChurn', JavaExec) {
     description = 'Runs the offline SDK client construction churn reproduction (Finding 2).'
     group = 'application'
     classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'com.example.athenachurn.AthenaClientChurnRepro'
+    mainClass = 'com.example.athenachurn.churn.AthenaClientChurnRepro'
     dependsOn(downloadAthenaJdbc)
 }

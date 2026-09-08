@@ -1,4 +1,4 @@
-package com.example.athenachurn;
+package com.example.athenachurn.datasource;
 
 import com.amazon.athena.jdbc.AthenaConnection;
 import com.amazon.athena.jdbc.authentication.CredentialsProviderRegistry;
@@ -23,11 +23,11 @@ import java.util.logging.Logger;
  * endpoint. {@code ConnectionTest=false} means construction issues no network calls, so this is
  * still fully offline.
  */
-final class ReflectionHopAthenaDataSource implements DataSource {
+public final class ReflectionHopAthenaDataSource implements DataSource {
 
     private final String mockBaseUrl;
 
-    ReflectionHopAthenaDataSource(String mockBaseUrl) {
+    public ReflectionHopAthenaDataSource(String mockBaseUrl) {
         this.mockBaseUrl = mockBaseUrl;
     }
 

@@ -1,4 +1,4 @@
-package com.example.athenachurn;
+package com.example.athenachurn.datasource;
 
 import software.amazon.awssdk.services.athena.AthenaAsyncClient;
 import software.amazon.awssdk.services.athena.model.StartQueryExecutionRequest;
@@ -24,16 +24,16 @@ import java.util.logging.Logger;
  * request DOES complete and the point is to show Hikari can actually add the connection to the
  * pool instead of timing out at {@code total=0}.
  */
-final class SucceedingAthenaDataSource implements DataSource {
+public final class SucceedingAthenaDataSource implements DataSource {
 
     private final AthenaAsyncClient athenaClient;
     private final CountDownLatch connectionAttemptStarted = new CountDownLatch(1);
 
-    SucceedingAthenaDataSource(AthenaAsyncClient athenaClient) {
+    public SucceedingAthenaDataSource(AthenaAsyncClient athenaClient) {
         this.athenaClient = athenaClient;
     }
 
-    boolean awaitConnectionAttempt(long timeout, TimeUnit unit) throws InterruptedException {
+    public boolean awaitConnectionAttempt(long timeout, TimeUnit unit) throws InterruptedException {
         return connectionAttemptStarted.await(timeout, unit);
     }
 

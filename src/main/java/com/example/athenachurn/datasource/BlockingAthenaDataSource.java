@@ -1,4 +1,4 @@
-package com.example.athenachurn;
+package com.example.athenachurn.datasource;
 
 import software.amazon.awssdk.services.athena.AthenaAsyncClient;
 import software.amazon.awssdk.services.athena.model.StartQueryExecutionRequest;
@@ -14,16 +14,16 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
-final class BlockingAthenaDataSource implements DataSource {
+public final class BlockingAthenaDataSource implements DataSource {
 
     private final AthenaAsyncClient athenaClient;
     private final CountDownLatch connectionAttemptStarted = new CountDownLatch(1);
 
-    BlockingAthenaDataSource(AthenaAsyncClient athenaClient) {
+    public BlockingAthenaDataSource(AthenaAsyncClient athenaClient) {
         this.athenaClient = athenaClient;
     }
 
-    boolean awaitConnectionAttempt(long timeout, TimeUnit unit) throws InterruptedException {
+    public boolean awaitConnectionAttempt(long timeout, TimeUnit unit) throws InterruptedException {
         return connectionAttemptStarted.await(timeout, unit);
     }
 

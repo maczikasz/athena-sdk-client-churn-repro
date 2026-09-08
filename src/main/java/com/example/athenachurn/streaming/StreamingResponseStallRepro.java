@@ -1,7 +1,9 @@
-package com.example.athenachurn;
+package com.example.athenachurn.streaming;
 
 import com.amazon.athena.client.results.GetQueryResultsStreamQueryResultsFactory;
 import com.amazon.athena.client.results.ResultParserFactory;
+import com.example.athenachurn.datasource.BlockingAthenaDataSource;
+import com.example.athenachurn.mock.MockAthenaServer;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -69,15 +71,11 @@ public final class StreamingResponseStallRepro {
                 .httpClient(httpClient)
                 .asyncConfiguration(inlineCompletions)
                 .build();
-            mock.armStreamingResponseHangOnce();
             var resultFactory = new GetQueryResultsStreamQueryResultsFactory(
                 streamingClient, Runnable::run, new ResultParserFactory()
             );
             resultFactory.create(QueryExecution.builder().queryExecutionId("mock-query-1").build());
 
-            if (!mock.awaitStreamingResponseHangStarted(15, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("The mock did not begin the partial streaming response");
-            }
             if (!awaitParserOnNettyEventLoop(5_000)) {
                 throw new IllegalStateException("The streaming parser was not found on the Netty event loop");
             }
@@ -112,10 +110,18 @@ public final class StreamingResponseStallRepro {
                 expected.printStackTrace(System.out);
             }
 
+            Thread.sleep(500);
+            if (!awaitParserOnNettyEventLoop(100)) {
+                throw new IllegalStateException(
+                    "The streaming parser unblocked after the response completed - deadlock not reproduced"
+                );
+            }
+
             System.out.println("Reproduced: GetQueryResultsStream parser blocks the sole Netty event loop.");
+            System.out.println("The server sent the whole response and closed it normally, but the parser is");
+            System.out.println("still blocked: only the wedged event loop could deliver those bytes.");
             System.out.println("Hikari remains at total=0 because its Athena connection request cannot complete.");
             printParserStack();
-            mock.releaseStreamingResponse();
         }
     }
 

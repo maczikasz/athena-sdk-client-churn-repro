@@ -1,7 +1,9 @@
-package com.example.athenachurn;
+package com.example.athenachurn.streaming;
 
 import com.amazon.athena.client.results.GetQueryResultsQueryResultsFactory;
 import com.amazon.athena.client.results.ResultParserFactory;
+import com.example.athenachurn.datasource.SucceedingAthenaDataSource;
+import com.example.athenachurn.mock.MockAthenaServer;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;

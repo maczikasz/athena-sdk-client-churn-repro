@@ -1,4 +1,4 @@
-package com.example.athenachurn;
+package com.example.athenachurn.churn;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;

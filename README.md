@@ -9,6 +9,16 @@ HTTPS mock stands in for the Athena service, so no AWS account and no network ac
 - **Finding 2**: the driver rebuilds all five of its internal AWS SDK clients on almost every
   HikariCP pool borrow, because `setNetworkTimeout` calls a method that discards them.
 
+## Project layout
+
+```
+com.example.athenachurn
+├── mock/        MockAthenaServer — local HTTPS stand-in for the Athena endpoints
+├── datasource/  DataSource adapters that wire the scenarios into real Hikari pools
+├── streaming/   Finding 1: StreamingResponseStallRepro plus both workaround repros
+└── churn/       Finding 2: AthenaClientChurnRepro
+```
+
 ## Finding 1: streaming result parsing can starve a Netty event loop
 
 ### Mechanism
@@ -22,18 +32,52 @@ at app//com.amazon.athena.client.results.GetQueryResultsStreamQueryResultsFactor
 at java.base/java.util.concurrent.CompletableFuture$UniApply.tryFire(CompletableFuture.java:646)
 ```
 
-A plain `thenApply` runs on whichever thread completes the future. For a streamed response, that
-is the Netty event-loop thread that is delivering the response bytes, inside `channelRead`. The
-attached continuation, `GetQueryResultsStreamResponseParser.parse` at line 39, calls
-`BufferedReader.readLine()` — a blocking read. It blocks waiting for more bytes, and those bytes
-can only be delivered by more `channelRead` calls on that same event-loop thread. If the event
-loop has only one thread (or all of its threads are already committed the same way), the loop
-never runs again: the blocking read waits forever for data only it could deliver.
+A plain `thenApply` runs on whichever thread completes the future. The attached continuation,
+`GetQueryResultsStreamResponseParser.parse` at line 39, calls `BufferedReader.readLine()` — a
+blocking read. If the completing thread is a Netty event-loop thread, the read waits for bytes
+that can only be delivered by more `channelRead` callbacks on that same thread. The loop never
+runs again: the read waits forever for data only it could deliver.
 
-This matches production JVM thread dumps: `aws-java-sdk-NettyEventLoop-6-0` blocked in exactly
-this parse frame, with two HikariCP `connection-adder` threads separately parked forever in the
-timeout-less `CompletableFuture.get()` at `AthenaStatementBase.getQueryExecutionId:179`, because
-their `StartQueryExecution` calls share the same wedged Netty infrastructure.
+No stalled server is required. Even a complete, well-formed response wedges the loop: the parser
+starts inside the `channelRead` that delivers the response headers, and the remaining body —
+including the end-of-stream marker — can only be handed to it by later events on the same thread.
+Netty's read timeout cannot rescue it either: that handler is scheduled on the blocked loop.
+
+### How this happens in production
+
+The driver does configure `SdkAdvancedAsyncClientOption.FUTURE_COMPLETION_EXECUTOR` on all its
+SDK clients, pointing at its own `athena-jdbc-*` thread pool (a bounded `ThreadPoolExecutor`:
+core `max(8, CPUs)`, max `max(64, 2×CPUs)`, queue capacity 1000, abort on rejection). So normally
+the parse hops off the event loop. But the AWS SDK's `MakeAsyncHttpRequestStage` only *attempts*
+that hop via `handleAsync`; if the executor rejects the task, the SDK logs a DEBUG message
+("Could not complete the service call future on the provided FUTURE_COMPLETION_EXECUTOR...") and
+falls back to completing the future synchronously — on the Netty event-loop thread.
+
+Production thread dumps show the telltale signs of exactly this fallback: the parser stack
+contains no `Completion.run`/`UnmanagedExecutor.execute` hop frames, and the JVM contains **zero**
+`athena-jdbc-*` threads. (Zero threads alone is ambiguous — the pool allows core-thread timeout,
+so an idle pool looks the same — but a live idle pool would have accepted the hop, and the missing
+hop frames rule that out.) The driver shuts that pool down in
+`ConnectionConfiguration.close()` (via `AthenaConnection.close()`), unconditionally, without
+waiting for in-flight requests — and the driver offers no way to abort an in-flight
+`GetQueryResultsStream` (`AsyncQueryResults` has no close/cancel; once requested, the HTTP
+response is delivered to completion no matter what the JDBC consumer does).
+
+So the real-world trigger is a close racing an in-flight stream. HikariCP never closes a borrowed
+connection, but the JDBC-level lifecycle routinely ends before the HTTP stream does — a
+response completes after the owning connection closed. Candidate sources include the paginator
+prefetching a page the consumer never reads, an error path abandoning a statement mid-stream, and
+a connection retired by max-lifetime immediately on return to the pool. (Plain early truncation
+by the consumer is not enough on its own where the query layer materializes the full result set
+before closing, as jOOQ's fetch() does.) When the late response bytes then arrive, the completion is rejected by
+the shut-down pool, the SDK falls back to synchronous completion, and the driver's blocking parse
+lands on the event loop — permanently.
+
+The blast radius is process-wide because the event loops are shared. The driver never sets an
+event-loop group on its `NettyNioAsyncHttpClient` builder, so every SDK client in the JVM draws
+from the SDK's shared, reference-counted group (`SharedSdkEventLoopGroup`). One blocked loop
+thread therefore starves requests from every connection and every pool, which is why fresh
+connection attempts hang on the same wedged loop instead of escaping to a new one.
 
 ### Reproduction
 
@@ -41,28 +85,27 @@ their `StartQueryExecution` calls share the same wedged Netty infrastructure.
 ./gradlew run
 ```
 
-`StreamingResponseStallRepro` builds a single-threaded Netty event-loop group and an Athena
-streaming client that uses it, points the client at a local HTTPS mock, and starts a
-`GetQueryResultsStreamQueryResultsFactory.create(...)` call. The mock sends the JSON metadata
-line, flushes, and then holds the connection open without sending the data row.
+`StreamingResponseStallRepro` builds a single-threaded Netty event-loop group, points an Athena
+streaming client at a local HTTPS mock, and starts a
+`GetQueryResultsStreamQueryResultsFactory.create(...)` call. The mock answers with a complete,
+well-formed streamed response — metadata line plus one data row — and closes it immediately. No
+artificial stall is needed: the parser blocks anyway, and the repro asserts it is *still* blocked
+after the server has sent every byte and closed the body.
 
-The repro also sets `FUTURE_COMPLETION_EXECUTOR` to `Runnable::run` (an inline executor). This is
-not the defect — it deterministically forces the *first* future in the completion chain to
-complete on the calling thread, so the response reliably arrives on the single Netty thread
-instead of racing with whatever executor the SDK's defaults would otherwise use. It reproduces,
-on demand, the same inline-on-the-event-loop completion the production thread dumps show
-happening anyway: the dumps show the parser already running on `aws-java-sdk-NettyEventLoop-6-0`
-without any such override, because the driver's own `thenApply` (not `thenApplyAsync`) is what
-puts it there in the first place.
+The client sets `FUTURE_COMPLETION_EXECUTOR` to `Runnable::run` to deterministically force the
+same inline-on-the-event-loop completion that production reaches through the SDK's rejection
+fallback described above.
 
 A real Hikari pool, backed by an `AthenaAsyncClient` sharing the same wedged event loop, then
 tries to borrow a connection. Real output from this repro:
 
 ```
 Reproduced the production-facing exception:
-java.sql.SQLTransientConnectionException: mcp-server-athena-write-pool-repro - Connection is not available, request timed out after 3005ms (total=0, active=0, idle=0, waiting=0)
+java.sql.SQLTransientConnectionException: mcp-server-athena-write-pool-repro - Connection is not available, request timed out after 3004ms (total=0, active=0, idle=0, waiting=0)
 
 Reproduced: GetQueryResultsStream parser blocks the sole Netty event loop.
+The server sent the whole response and closed it normally, but the parser is
+still blocked: only the wedged event loop could deliver those bytes.
 Hikari remains at total=0 because its Athena connection request cannot complete.
 Thread "aws-java-sdk-NettyEventLoop-repro-0" (state=WAITING):
     ...

@@ -1,4 +1,4 @@
-package com.example.athenachurn;
+package com.example.athenachurn.mock;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpsConfigurator;
@@ -26,9 +26,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Local HTTPS implementation of the Athena calls needed to connect and fetch one streamed result,
  * or one buffered result page through the GetQueryResults API.
  */
-final class MockAthenaServer implements AutoCloseable {
+public final class MockAthenaServer implements AutoCloseable {
 
     private static final long HANG_MAX_MILLIS = 180_000;
+
+    private static final String STREAMING_METADATA = "{\"columnInfo\":[{\"catalogName\":\"hive\","
+        + "\"schemaName\":\"\",\"tableName\":\"\",\"name\":\"one\",\"label\":\"one\",\"type\":\"integer\","
+        + "\"precision\":10,\"scale\":0,\"nullable\":\"UNKNOWN\",\"caseSensitive\":false}]}\n";
+    private static final String STREAMING_DATA_ROW = "{\"data\":[{\"varCharValue\":\"1\"}]}\n";
 
     private final HttpsServer server;
     private final AtomicBoolean hangStreamingResponseOnce = new AtomicBoolean();
@@ -43,7 +48,7 @@ final class MockAthenaServer implements AutoCloseable {
         this.server = server;
     }
 
-    static MockAthenaServer startOnRandomPort() throws Exception {
+    public static MockAthenaServer startOnRandomPort() throws Exception {
         HttpsServer server = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.setHttpsConfigurator(new HttpsConfigurator(generateSelfSignedContextAndInstallTrust()));
         MockAthenaServer mock = new MockAthenaServer(server);
@@ -57,41 +62,41 @@ final class MockAthenaServer implements AutoCloseable {
         return mock;
     }
 
-    String baseUrl() {
+    public String baseUrl() {
         return "https://127.0.0.1:" + server.getAddress().getPort();
     }
 
-    void armStreamingResponseHangOnce() {
+    public void armStreamingResponseHangOnce() {
         hangStreamingResponseOnce.set(true);
         streamingHangStarted = new CountDownLatch(1);
         releaseStreamingResponse = new CountDownLatch(1);
     }
 
-    boolean awaitStreamingResponseHangStarted(long timeout, TimeUnit unit) throws InterruptedException {
+    public boolean awaitStreamingResponseHangStarted(long timeout, TimeUnit unit) throws InterruptedException {
         return streamingHangStarted.await(timeout, unit);
     }
 
-    void releaseStreamingResponse() {
+    public void releaseStreamingResponse() {
         releaseStreamingResponse.countDown();
     }
 
     /** Arms a one-time mid-body stall on the buffered GetQueryResults response. */
-    void armGetQueryResultsHangOnce() {
+    public void armGetQueryResultsHangOnce() {
         hangGetQueryResultsOnce.set(true);
         getQueryResultsHangStarted = new CountDownLatch(1);
         releaseGetQueryResults = new CountDownLatch(1);
     }
 
-    boolean awaitGetQueryResultsHangStarted(long timeout, TimeUnit unit) throws InterruptedException {
+    public boolean awaitGetQueryResultsHangStarted(long timeout, TimeUnit unit) throws InterruptedException {
         return getQueryResultsHangStarted.await(timeout, unit);
     }
 
-    void releaseGetQueryResults() {
+    public void releaseGetQueryResults() {
         releaseGetQueryResults.countDown();
     }
 
     /** Every X-Amz-Target header value seen so far, in request order. */
-    List<String> requestedTargets() {
+    public List<String> requestedTargets() {
         return List.copyOf(requestedTargets);
     }
 
@@ -176,20 +181,13 @@ final class MockAthenaServer implements AutoCloseable {
     private void handleStreamingResults(HttpExchange exchange) throws IOException {
         boolean hang = hangStreamingResponseOnce.compareAndSet(true, false);
         if (hang) {
-            try {
-                Thread.sleep(200);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            sleep(200);
         }
 
-        String metadata = "{\"columnInfo\":[{\"catalogName\":\"hive\",\"schemaName\":\"\","
-            + "\"tableName\":\"\",\"name\":\"one\",\"label\":\"one\",\"type\":\"integer\","
-            + "\"precision\":10,\"scale\":0,\"nullable\":\"UNKNOWN\",\"caseSensitive\":false}]}\n";
         exchange.getResponseHeaders().set("Content-Type", "application/octet-stream");
         exchange.sendResponseHeaders(200, 0);
         try (OutputStream output = exchange.getResponseBody()) {
-            output.write(metadata.getBytes(StandardCharsets.UTF_8));
+            output.write(STREAMING_METADATA.getBytes(StandardCharsets.UTF_8));
             output.flush();
             if (hang) {
                 streamingHangStarted.countDown();
@@ -199,8 +197,16 @@ final class MockAthenaServer implements AutoCloseable {
                     Thread.currentThread().interrupt();
                 }
             } else {
-                output.write("{\"data\":[{\"varCharValue\":\"1\"}]}\n".getBytes(StandardCharsets.UTF_8));
+                output.write(STREAMING_DATA_ROW.getBytes(StandardCharsets.UTF_8));
             }
+        }
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
