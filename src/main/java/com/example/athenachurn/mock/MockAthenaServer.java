@@ -42,6 +42,9 @@ public final class MockAthenaServer implements AutoCloseable {
     private final AtomicBoolean hangGetQueryResultsOnce = new AtomicBoolean();
     private volatile CountDownLatch getQueryResultsHangStarted;
     private volatile CountDownLatch releaseGetQueryResults;
+    private final AtomicBoolean holdStreamingHeadersOnce = new AtomicBoolean();
+    private volatile CountDownLatch streamingRequestArrived;
+    private volatile CountDownLatch releaseStreamingHeaders;
     private final List<String> requestedTargets = new CopyOnWriteArrayList<>();
 
     private MockAthenaServer(HttpsServer server) {
@@ -78,6 +81,27 @@ public final class MockAthenaServer implements AutoCloseable {
 
     public void releaseStreamingResponse() {
         releaseStreamingResponse.countDown();
+    }
+
+    /**
+     * Arms a one-time hold of the streaming response BEFORE any header byte is sent. This models
+     * Athena taking a long time to return the first byte of a result (a queued or slow query),
+     * which is the window the mid-flight close scenario needs. The mid-body hang above models a
+     * stall after the headers arrived; this one models a stall before them, so the SDK response
+     * future is still incomplete while the hold lasts.
+     */
+    public void armStreamingHeaderHoldOnce() {
+        holdStreamingHeadersOnce.set(true);
+        streamingRequestArrived = new CountDownLatch(1);
+        releaseStreamingHeaders = new CountDownLatch(1);
+    }
+
+    public boolean awaitStreamingRequestArrived(long timeout, TimeUnit unit) throws InterruptedException {
+        return streamingRequestArrived.await(timeout, unit);
+    }
+
+    public void releaseStreamingHeaders() {
+        releaseStreamingHeaders.countDown();
     }
 
     /** Arms a one-time mid-body stall on the buffered GetQueryResults response. */
@@ -179,6 +203,15 @@ public final class MockAthenaServer implements AutoCloseable {
     }
 
     private void handleStreamingResults(HttpExchange exchange) throws IOException {
+        boolean holdHeaders = holdStreamingHeadersOnce.compareAndSet(true, false);
+        if (holdHeaders) {
+            streamingRequestArrived.countDown();
+            try {
+                releaseStreamingHeaders.await(HANG_MAX_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         boolean hang = hangStreamingResponseOnce.compareAndSet(true, false);
         if (hang) {
             sleep(200);

@@ -15,7 +15,7 @@ HTTPS mock stands in for the Athena service, so no AWS account and no network ac
 com.example.athenachurn
 ├── mock/        MockAthenaServer — local HTTPS stand-in for the Athena endpoints
 ├── datasource/  DataSource adapters that wire the scenarios into real Hikari pools
-├── streaming/   Finding 1: StreamingResponseStallRepro plus both workaround repros
+├── streaming/   Finding 1: StreamingResponseStallRepro, MidFlightCloseRepro, both workaround repros
 └── churn/       Finding 2: AthenaClientChurnRepro
 ```
 
@@ -118,6 +118,50 @@ Thread "aws-java-sdk-NettyEventLoop-repro-0" (state=WAITING):
 This is the same failure shape production reported: `SQLTransientConnectionException` with
 `total=0, active=0, idle=0, waiting=0`, and a Netty event-loop thread blocked in
 `BufferedReader.readLine` inside the driver's own parser frame.
+
+### End-to-end reproduction: the same wedge through the SDK's own rejection fallback
+
+```bash
+./gradlew runMidFlightClose
+```
+
+`MidFlightCloseRepro` removes the one shortcut in the scenario above. It does not inject
+`Runnable::run`; it builds the exact completion executor the driver builds
+(`ConnectionConfiguration#createExecutor`), registers it as `FUTURE_COMPLETION_EXECUTOR`, and
+reaches the inline completion the way production does. It runs the same slow response twice:
+
+- **Phase A — slow response, executor alive.** The mock holds the streaming response before the
+  first header byte (a query that takes a long time to return its first result byte). The caller
+  blocks in a timeout-less `get()` throughout. When the bytes arrive, the completion hops onto an
+  `athena-jdbc-*` thread, the blocking parse runs there, and the call completes. A second request
+  on the same event loop succeeds. A slow response alone recovers.
+- **Phase B — the same slow response, executor shut down mid-flight.** While the response is
+  still held, the repro calls `shutdown()` on the completion executor — what
+  `ConnectionConfiguration.close()` does when the connection that issued the request is closed
+  with the request outstanding. When the response then arrives, the SDK logs its fallback line
+  and completes the future on the event loop, where the parse blocks forever. The repro asserts
+  the fallback frame (`MakeAsyncHttpRequestStage.lambda$executeHttpRequest$6`) is on the wedged
+  stack, shows a second request never completing, and reproduces the same
+  `total=0, active=0, idle=0, waiting=0` Hikari exception.
+
+Real output from Phase B:
+
+```
+[aws-java-sdk-NettyEventLoop-repro-0] DEBUG software.amazon.awssdk...MakeAsyncHttpRequestStage - Could not complete the service call future on the provided FUTURE_COMPLETION_EXECUTOR. The future will be completed synchronously by thread aws-java-sdk-NettyEventLoop-repro-0. ...
+Thread "aws-java-sdk-NettyEventLoop-repro-0" (state=WAITING):
+    ...
+    at java.base/java.io.BufferedReader.readLine(BufferedReader.java:436)
+    at app//com.amazon.athena.client.results.parsing.GetQueryResultsStreamResponseParser.parse(GetQueryResultsStreamResponseParser.java:39)
+    ...
+    at app//software.amazon.awssdk.core.internal.http.pipeline.stages.MakeAsyncHttpRequestStage.lambda$executeHttpRequest$6(MakeAsyncHttpRequestStage.java:187)
+    ...
+    at app//io.netty.channel.nio.NioEventLoop.run(NioEventLoop.java:562)
+A second request on the same event loop never completes. WEDGED.
+```
+
+The two phases differ by a single call: `completionExecutor.shutdown()` while the response was in
+flight. A slow response is the precondition; the mid-flight close is what turns it into a
+permanent wedge.
 
 ## Finding 2: SDK client construction churn on every pool borrow
 

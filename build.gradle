@@ -93,6 +93,14 @@ tasks.register('runReflectionExecutorHop', JavaExec) {
     dependsOn(downloadAthenaJdbc)
 }
 
+tasks.register('runMidFlightClose', JavaExec) {
+    description = 'Runs the two-phase slow-response scenario: benign recovery vs mid-flight executor shutdown wedge.'
+    group = 'application'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.example.athenachurn.streaming.MidFlightCloseRepro'
+    dependsOn(downloadAthenaJdbc)
+}
+
 tasks.register('runChurn', JavaExec) {
     description = 'Runs the offline SDK client construction churn reproduction (Finding 2).'
     group = 'application'
