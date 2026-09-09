@@ -78,14 +78,14 @@ public final class TimeoutInterruptRepro {
 
             String phases = System.getProperty("phases", "sweep,B,C,E,D,F");
             int trials = Integer.getInteger("trials", 1);
-            if (phases.equals("C") || phases.equals("F")) {
+            if (phases.equals("C") || phases.equals("F") || phases.equals("G")) {
                 int wedged = 0;
                 for (int i = 1; i <= trials; i++) {
                     System.out.println();
                     System.out.println("=== Phase " + phases + " trial " + i + "/" + trials + " ===");
                     boolean ok = phases.equals("C")
                         ? phaseCEvictDuringOrphanedStreamFetch(mock, pool, dsl, StreamHold.HEADERS, 1_500)
-                        : phaseFDetachedClientThenClose(mock);
+                        : phaseFDetachedClientThenClose(mock, !phases.equals("G"));
                     System.out.println("VERDICT phase" + phases + " trial " + i + " -> " + (ok ? "recovered" : "WEDGED"));
                     if (!ok) {
                         wedged++;
@@ -139,7 +139,7 @@ public final class TimeoutInterruptRepro {
 
             System.out.println();
             System.out.println("=== Phase F: orphan's SDK client detached by Hikari's setNetworkTimeout (Finding 2), THEN close() ===");
-            healthy = phaseFDetachedClientThenClose(mock);
+            healthy = phaseFDetachedClientThenClose(mock, true);
             System.out.println("VERDICT phaseF -> " + (healthy ? "recovered" : "WEDGED"));
         }
     }
@@ -158,7 +158,8 @@ public final class TimeoutInterruptRepro {
      * headers. The response future completes; the hop onto the completion executor is rejected;
      * the SDK completes it on the Netty event loop; the blocking parse runs there.
      */
-    private static boolean phaseFDetachedClientThenClose(MockAthenaServer mock) throws Exception {
+    /** @param evict false = Phase G: detachment only, no physical close. Tests whether Finding 2 alone suffices. */
+    private static boolean phaseFDetachedClientThenClose(MockAthenaServer mock, boolean evict) throws Exception {
         try (HikariDataSource single = productionShapedPool(mock.baseUrl(), 1)) {
             DSLContext dsl = productionShapedDsl(single);
             dsl.fetch("select 1 one from (values(1))");
@@ -190,10 +191,14 @@ public final class TimeoutInterruptRepro {
             }
             System.out.println("(3) Orphaned GetQueryResultsStream in flight on the DETACHED client (headers held).");
 
-            // (4) Real close(): closes the current clients, skips the detached one, shuts executors.
-            single.getHikariPoolMXBean().softEvictConnections();
-            Thread.sleep(300);
-            System.out.println("(4) Evicted -> ConnectionConfiguration.close() ran. " + poolState(single));
+            if (evict) {
+                // (4) Real close(): closes the current clients, skips the detached one, shuts executors.
+                single.getHikariPoolMXBean().softEvictConnections();
+                Thread.sleep(300);
+                System.out.println("(4) Evicted -> ConnectionConfiguration.close() ran. " + poolState(single));
+            } else {
+                System.out.println("(4) SKIPPED (Phase G): no physical close; only the detachment from step (2).");
+            }
 
             // (5) The held response now arrives.
             mock.releaseStreamingHeaders();

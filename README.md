@@ -174,6 +174,7 @@ the timeout and flips it to SUCCEEDED on command.
 
     ./gradlew runTimeoutInterrupt                       # sweep + phases B, C, E, D, F in order
     ./gradlew runTimeoutInterrupt -Pphases=F -Ptrials=3 # the decisive phase, repeated
+    ./gradlew runTimeoutInterrupt -Pphases=G -Ptrials=3 # phase F without the close: never wedges
 
 What each phase established (all verified against driver 3.8.0, Hikari 7.1.0, Reactor 3.8.7 bytecode
 and then observed at runtime):
@@ -209,11 +210,21 @@ and then observed at runtime):
    production dynamic: follow-up requests routed to that loop fail with
    `Acquire operation took longer than 15000 milliseconds` or never return, so pools drain over time.
 
+5. **Detachment alone is not enough (phase G).** Phase F without the eviction recovers every time:
+   the configuration creates its completion executor once, in its constructor, and every client
+   generation shares it, so nulling the clients leaves the orphan's executor alive. A physical
+   close of the connection is required. Finding 2 is what makes that close lethal; it does not
+   replace it.
+
 Production correlate (Develocity, apache instance, 2026-09-07): the probe timed out at 16:08:44.783 UTC;
 136 ms later another borrow validated a connection (the detachment step); the query reached SUCCEEDED
 at 16:08:45.202 and the pod never issued another Athena request. Which physical close ran on that
-connection in production is not identified; the code has no eviction of its own, validation never
-exceeded its 15 s timeout, so `maxLifetime` rotation is the remaining routine candidate.
+connection in production is not identified. The application has no eviction of its own, validation
+never exceeded its 15 s timeout, and `maxLifetime` rotation (8 h across 30 connections, one close
+per ~16 min) is far too rare to land inside sub-second windows three times in 25 timeouts. The
+production thread dumps show the wedged loop frame-for-frame as phase F, with both pools'
+connection-adder threads created 17-20 s after the onset — that is `validationTimeout` expiring on
+the dead loop, a consequence of the wedge, not its cause.
 
 Two conclusions for the driver, beyond Finding 1's parse-on-loop: the detach-without-close in
 `setApiRequestTimeout` is what lets a request outlive its configuration's `close()`, and an abandoned
