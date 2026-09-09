@@ -163,6 +163,62 @@ The two runs differ by a single call: `completionExecutor.shutdown()` while the 
 flight. A slow response is the precondition; the mid-flight close is what turns it into a
 permanent wedge.
 
+### Production-shaped reproduction: no hand-rolled `shutdown()` (`runTimeoutInterrupt`)
+
+`MidFlightCloseRepro` proves the driver-side fallback is lethal, but it reaches the lethal state by
+calling `shutdown()` on the completion executor itself. This scenario reaches it the way production
+does, on the real stack: HikariCP 7.1.0 pool of real driver connections, jOOQ 3.21.6 `fetch`, and
+Reactor 3.8.7 `Mono.fromCallable(..).subscribeOn(boundedElastic()).timeout(T, fallback)` — the
+exact shape of the Develocity mcp-server Athena health probe. The mock keeps the query RUNNING past
+the timeout and flips it to SUCCEEDED on command.
+
+    ./gradlew runTimeoutInterrupt                       # sweep + phases B, C, E, D, F in order
+    ./gradlew runTimeoutInterrupt -Pphases=F -Ptrials=3 # the decisive phase, repeated
+
+What each phase established (all verified against driver 3.8.0, Hikari 7.1.0, Reactor 3.8.7 bytecode
+and then observed at runtime):
+
+1. **The timeout interrupts the worker, and nothing evicts the connection.** Reactor's
+   `SchedulerTask.dispose()` calls `future.cancel(true)` from the timeout thread. The driver rethrows
+   the `InterruptedException` as `new SQLException(message, cause)` — no SQLState. Hikari's
+   `checkException` evicts only on SQLState `08*` or its fixed error lists, so the connection goes
+   back to the pool alive, executor alive. The sweep (query completes 0.4 s or 5 s after the
+   timeout) never wedges by itself.
+2. **The driver leaves an ownerless async chain behind.** After the caller is gone, the statement's
+   poll → fetch chain keeps running. When the poll sees SUCCEEDED it issues `GetQueryResultsStream`
+   for a result nobody will read. There is no way to cancel it (`AsyncQueryResults` has no
+   close/abort). Phase B shows a plain `Statement.close()` during execution does send
+   `StopQueryExecution`, but the jOOQ/interrupt path does not reach it — and the mock answers it
+   with AccessDenied, as a read-only role would, which the driver swallows silently.
+3. **The real `close()` alone does not wedge (phases C, D, E).** `ConnectionConfiguration.close()`
+   closes the five SDK clients *before* it shuts the executors. Each client owns its own Netty HTTP
+   client, so closing it aborts the in-flight stream; the SDK fails the request fast on the loop
+   instead of parsing it. Six isolated trials of C: zero wedges.
+4. **Finding 2 supplies the missing step (phase F, deterministic).** Any borrow of that connection
+   makes Hikari call `setNetworkTimeout` around `isValid`, and the driver's `setApiRequestTimeout`
+   nulls its five client fields without closing them. The orphaned chain still holds the old
+   streaming client; the configuration no longer does. When the connection is then physically
+   closed (Hikari eviction here; `maxLifetime` rotation or any other physical close in production),
+   `close()` skips the detached client and shuts the completion executor down. The detached
+   client's stream response then completes, the hop is rejected, the SDK completes the future on
+   the Netty event loop, and the blocking parse parks there:
+
+       aws-java-sdk-NettyEventLoop-2-1 WAITING at GetQueryResultsStreamResponseParser.parse(GetQueryResultsStreamResponseParser.java:39)
+
+   That is the exact frame from the production thread dumps. The drain check that follows shows the
+   production dynamic: follow-up requests routed to that loop fail with
+   `Acquire operation took longer than 15000 milliseconds` or never return, so pools drain over time.
+
+Production correlate (Develocity, apache instance, 2026-09-07): the probe timed out at 16:08:44.783 UTC;
+136 ms later another borrow validated a connection (the detachment step); the query reached SUCCEEDED
+at 16:08:45.202 and the pod never issued another Athena request. Which physical close ran on that
+connection in production is not identified; the code has no eviction of its own, validation never
+exceeded its 15 s timeout, so `maxLifetime` rotation is the remaining routine candidate.
+
+Two conclusions for the driver, beyond Finding 1's parse-on-loop: the detach-without-close in
+`setApiRequestTimeout` is what lets a request outlive its configuration's `close()`, and an abandoned
+statement keeps issuing network requests with no way to stop it.
+
 ## Finding 2: SDK client construction churn on every pool borrow
 
 ### Mechanism

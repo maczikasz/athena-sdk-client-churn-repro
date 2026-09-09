@@ -21,6 +21,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Local HTTPS implementation of the Athena calls needed to connect and fetch one streamed result,
@@ -45,6 +46,12 @@ public final class MockAthenaServer implements AutoCloseable {
     private final AtomicBoolean holdStreamingHeadersOnce = new AtomicBoolean();
     private volatile CountDownLatch streamingRequestArrived;
     private volatile CountDownLatch releaseStreamingHeaders;
+    // Query-state hold: GetQueryExecution answers RUNNING until released. Models a query that is
+    // still executing when a caller-side timeout fires.
+    private final AtomicBoolean holdQueryRunning = new AtomicBoolean();
+    private volatile CountDownLatch releaseQueryCompletion;
+    private final AtomicInteger stopQueryExecutionCount = new AtomicInteger();
+    private volatile boolean denyStopQueryExecution = true;
     private final List<String> requestedTargets = new CopyOnWriteArrayList<>();
 
     private MockAthenaServer(HttpsServer server) {
@@ -119,6 +126,36 @@ public final class MockAthenaServer implements AutoCloseable {
         releaseGetQueryResults.countDown();
     }
 
+    /**
+     * Arms a hold on the query state: every GetQueryExecution answers RUNNING until
+     * {@link #releaseQueryCompletion()} flips it to SUCCEEDED. The driver keeps polling and the
+     * borrower thread stays parked in the driver's execute wait for as long as the hold lasts.
+     */
+    public void armQueryRunningHold() {
+        releaseQueryCompletion = new CountDownLatch(1);
+        holdQueryRunning.set(true);
+    }
+
+    public void releaseQueryCompletion() {
+        holdQueryRunning.set(false);
+        CountDownLatch latch = releaseQueryCompletion;
+        if (latch != null) {
+            latch.countDown();
+        }
+    }
+
+    /**
+     * Whether StopQueryExecution is answered with AccessDenied (the default, matching a read-only
+     * IAM role that lacks {@code athena:StopQueryExecution}) or with success.
+     */
+    public void denyStopQueryExecution(boolean deny) {
+        this.denyStopQueryExecution = deny;
+    }
+
+    public int stopQueryExecutionCount() {
+        return stopQueryExecutionCount.get();
+    }
+
     /** Every X-Amz-Target header value seen so far, in request order. */
     public List<String> requestedTargets() {
         return List.copyOf(requestedTargets);
@@ -143,16 +180,38 @@ public final class MockAthenaServer implements AutoCloseable {
             return;
         }
 
+        if (target.endsWith("StopQueryExecution")) {
+            stopQueryExecutionCount.incrementAndGet();
+            if (denyStopQueryExecution) {
+                byte[] denied = ("{\"__type\":\"com.amazonaws.athena#AccessDeniedException\","
+                    + "\"Message\":\"User: arn:aws:sts::000000000000:assumed-role/mock/read-only is not authorized "
+                    + "to perform: athena:StopQueryExecution on resource: mock-query-1\"}").getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/x-amz-json-1.1");
+                exchange.getResponseHeaders().set("x-amzn-ErrorType", "AccessDeniedException");
+                exchange.sendResponseHeaders(400, denied.length);
+                try (OutputStream output = exchange.getResponseBody()) {
+                    output.write(denied);
+                }
+                return;
+            }
+        }
+
         String response;
         if (target.endsWith("StartQueryExecution")) {
             response = "{\"QueryExecutionId\":\"mock-query-1\"}";
+        } else if (target.endsWith("StopQueryExecution")) {
+            response = "{}";
         } else if (target.endsWith("GetQueryExecution")) {
+            boolean running = holdQueryRunning.get();
+            String status = running
+                ? "\"Status\":{\"State\":\"RUNNING\",\"SubmissionDateTime\":1700000000.0},"
+                : "\"Status\":{\"State\":\"SUCCEEDED\",\"SubmissionDateTime\":1700000000.0,"
+                    + "\"CompletionDateTime\":1700000000.5},";
             response = "{\"QueryExecution\":{\"QueryExecutionId\":\"mock-query-1\","
                 + "\"Query\":\"SELECT 1\",\"StatementType\":\"DML\","
                 + "\"ResultConfiguration\":{\"OutputLocation\":\"s3://mock-bucket/results/\"},"
                 + "\"QueryExecutionContext\":{\"Database\":\"default\",\"Catalog\":\"AwsDataCatalog\"},"
-                + "\"Status\":{\"State\":\"SUCCEEDED\",\"SubmissionDateTime\":1700000000.0,"
-                + "\"CompletionDateTime\":1700000000.5},\"Statistics\":{\"EngineExecutionTimeInMillis\":10,"
+                + status + "\"Statistics\":{\"EngineExecutionTimeInMillis\":10,"
                 + "\"DataScannedInBytes\":0,\"TotalExecutionTimeInMillis\":10,\"QueryQueueTimeInMillis\":0,"
                 + "\"QueryPlanningTimeInMillis\":1,\"ServiceProcessingTimeInMillis\":1},"
                 + "\"WorkGroup\":\"primary\"}}";
