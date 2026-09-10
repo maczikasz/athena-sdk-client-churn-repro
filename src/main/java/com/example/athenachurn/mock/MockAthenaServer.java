@@ -54,6 +54,19 @@ public final class MockAthenaServer implements AutoCloseable {
     private volatile boolean denyStopQueryExecution = true;
     private final List<String> requestedTargets = new CopyOnWriteArrayList<>();
 
+    // ---- soak mode: per-query state and random slowness. Off unless enableSoakMode() is called.
+    private volatile boolean soakMode;
+    private final AtomicInteger queryCounter = new AtomicInteger();
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> queryReadyAtMillis = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, String> queryText = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile double slowQueryProbability;
+    private volatile long slowQueryMinMillis, slowQueryMaxMillis;
+    private volatile double slowApiCallProbability;
+    private volatile long slowApiCallMillis;
+    private final java.util.Random random = new java.util.Random();
+    private final AtomicInteger slowQueriesInjected = new AtomicInteger();
+    private final AtomicInteger slowApiCallsInjected = new AtomicInteger();
+
     private MockAthenaServer(HttpsServer server) {
         this.server = server;
     }
@@ -156,6 +169,37 @@ public final class MockAthenaServer implements AutoCloseable {
         return stopQueryExecutionCount.get();
     }
 
+    /**
+     * Soak mode: every StartQueryExecution gets its own id and its own completion time. A query is
+     * RUNNING until its completion time and SUCCEEDED afterwards. With probability
+     * {@code slowQueryProbability} a query takes between {@code minMillis} and {@code maxMillis}
+     * (Athena-side slowness, as seen in production); otherwise it completes at once. With
+     * probability {@code slowApiCallProbability} any control-plane call (Start/Get/Stop) is
+     * delayed by {@code slowApiCallMillis} before it is answered (API-side slowness).
+     */
+    public void enableSoakMode(double slowQueryProbability, long minMillis, long maxMillis,
+                               double slowApiCallProbability, long slowApiCallMillis) {
+        this.soakMode = true;
+        this.slowQueryProbability = slowQueryProbability;
+        this.slowQueryMinMillis = minMillis;
+        this.slowQueryMaxMillis = maxMillis;
+        this.slowApiCallProbability = slowApiCallProbability;
+        this.slowApiCallMillis = slowApiCallMillis;
+    }
+
+    public int slowQueriesInjected() {
+        return slowQueriesInjected.get();
+    }
+
+    public int slowApiCallsInjected() {
+        return slowApiCallsInjected.get();
+    }
+
+    private static String bodyField(String body, String field) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"" + field + "\"\s*:\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(body);
+        return m.find() ? m.group(1) : null;
+    }
+
     /** Every X-Amz-Target header value seen so far, in request order. */
     public List<String> requestedTargets() {
         return List.copyOf(requestedTargets);
@@ -175,6 +219,11 @@ public final class MockAthenaServer implements AutoCloseable {
 
         String target = exchange.getRequestHeaders().getFirst("X-Amz-Target");
         requestedTargets.add(target);
+        String body = soakMode ? new String(readAll(exchange.getRequestBody()), StandardCharsets.UTF_8) : "";
+        if (soakMode && !target.endsWith("GetQueryResults") && random.nextDouble() < slowApiCallProbability) {
+            slowApiCallsInjected.incrementAndGet();
+            sleep(slowApiCallMillis);
+        }
         if (target.endsWith("GetQueryResults")) {
             handleBufferedGetQueryResults(exchange);
             return;
@@ -197,17 +246,37 @@ public final class MockAthenaServer implements AutoCloseable {
         }
 
         String response;
+        String queryId = "mock-query-1";
+        if (soakMode) {
+            String fromBody = bodyField(body, "QueryExecutionId");
+            if (fromBody != null) {
+                queryId = fromBody;
+            }
+        }
         if (target.endsWith("StartQueryExecution")) {
-            response = "{\"QueryExecutionId\":\"mock-query-1\"}";
+            if (soakMode) {
+                queryId = "soak-query-" + queryCounter.incrementAndGet();
+                long delay = 0;
+                if (random.nextDouble() < slowQueryProbability) {
+                    delay = slowQueryMinMillis + (long) (random.nextDouble() * (slowQueryMaxMillis - slowQueryMinMillis));
+                    slowQueriesInjected.incrementAndGet();
+                }
+                queryReadyAtMillis.put(queryId, System.currentTimeMillis() + delay);
+                String q = bodyField(body, "QueryString");
+                queryText.put(queryId, q == null ? "?" : q);
+            }
+            response = "{\"QueryExecutionId\":\"" + queryId + "\"}";
         } else if (target.endsWith("StopQueryExecution")) {
             response = "{}";
         } else if (target.endsWith("GetQueryExecution")) {
-            boolean running = holdQueryRunning.get();
+            boolean running = soakMode
+                ? System.currentTimeMillis() < queryReadyAtMillis.getOrDefault(queryId, 0L)
+                : holdQueryRunning.get();
             String status = running
                 ? "\"Status\":{\"State\":\"RUNNING\",\"SubmissionDateTime\":1700000000.0},"
                 : "\"Status\":{\"State\":\"SUCCEEDED\",\"SubmissionDateTime\":1700000000.0,"
                     + "\"CompletionDateTime\":1700000000.5},";
-            response = "{\"QueryExecution\":{\"QueryExecutionId\":\"mock-query-1\","
+            response = "{\"QueryExecution\":{\"QueryExecutionId\":\"" + queryId + "\","
                 + "\"Query\":\"SELECT 1\",\"StatementType\":\"DML\","
                 + "\"ResultConfiguration\":{\"OutputLocation\":\"s3://mock-bucket/results/\"},"
                 + "\"QueryExecutionContext\":{\"Database\":\"default\",\"Catalog\":\"AwsDataCatalog\"},"

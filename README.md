@@ -230,6 +230,48 @@ Two conclusions for the driver, beyond Finding 1's parse-on-loop: the detach-wit
 `setApiRequestTimeout` is what lets a request outlive its configuration's `close()`, and an abandoned
 statement keeps issuing network requests with no way to stop it.
 
+### Soak: the wedge from random Athena slowness alone (`runSoak`)
+
+The scenarios above force each step. This one forces nothing. It runs the mcp-server health probe
+(`AdaptiveHealthProbe` shape, probe queries verbatim) plus background tool queries against a mock
+Athena that is randomly slow, on the pool configuration Develocity shipped **before 2026-08-31** —
+the build the production incidents happened on:
+
+- `maxLifetime` 30 min (scaled to 40 s here), `connectionTimeout` 3 s, `validationTimeout` 15 s,
+- `connectionInitSql("select 1")` on top of the driver's ConnectionTest,
+- no `NetworkTimeoutMillis` pin, so HikariCP's `setNetworkTimeout` detaches the driver's clients on
+  every validation and every close,
+- `ResultFetcher=GetQueryResultsStream`.
+
+HikariCP logs at DEBUG, so every close carries its reason. `-XX:ActiveProcessorCount=1` gives the
+production pod's two-loop SDK event-loop group.
+
+    ./gradlew runSoak -Psoak.seconds=120 -Psoak.passIntervalSeconds=8 -Psoak.maxLifetimeSeconds=40
+
+It wedged in 2 of 4 two-minute runs, and both logs show the same sequence to the millisecond:
+
+    15:54:21.273 [boundedElastic-1]   Query soak-query-50 is executing          <- probe borrows, slow query
+    15:54:31.331 [connection-closer]  Closing connection ...@4156624f: (connection was evicted)
+    15:54:31.331 [boundedElastic-1]   Operator called default onErrorDropped     <- the probe timeout; same ms
+    15:54:32.974 [NettyEventLoop-2-1] Query execution soak-query-50 has state SUCCEEDED
+    15:54:33.494 *** WEDGE DETECTED *** NettyEventLoop-2-1 WAITING at GetQueryResultsStreamResponseParser.parse:39
+
+Read in order: the probe holds a connection for its slow query; `maxLifetime` expires during that
+borrow, and HikariCP marks the connection because it cannot close one in use; the probe times out,
+the thread is interrupted and returns the connection, and HikariCP closes it on return —
+`(connection was evicted)` — in the same millisecond as the timeout. That close is
+`ConnectionConfiguration.close()`: it shuts the completion executor, but the abandoned query is
+still polling on a client the driver had already detached, so `close()` never reached it. Two
+seconds later that poll completes with no executor to hop to, so it runs on the Netty event loop
+(`[NettyEventLoop-2-1] ... has state SUCCEEDED`), fetches the stream from there, and the blocking
+parse parks the loop.
+
+This is why production closes were always within a second of a probe timeout (5 of 6 in the Athena
+history): the close *is* the probe's return. A long borrow is exactly when a lifetime expiry gets
+caught in use. The remaining open number is how often a 30-minute lifetime lands inside a 30-second
+borrow at production traffic; HikariCP DEBUG on a production pod (`Closing connection ...:
+(connection was evicted)` right after `probe exceeded PT30S`) settles it directly.
+
 ## Finding 2: SDK client construction churn on every pool borrow
 
 ### Mechanism
