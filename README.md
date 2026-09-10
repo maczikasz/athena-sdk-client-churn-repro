@@ -1,4 +1,4 @@
-# Athena JDBC driver 3.8.0: two offline reproductions and two workarounds
+# Athena JDBC driver 3.8.0: an event-loop wedge reproduced offline, and its ingredients
 
 This project reproduces two independent defects in the AWS Athena JDBC driver, version 3.8.0,
 and demonstrates two code-level workarounds for the first one. Everything runs offline: a local
@@ -15,7 +15,7 @@ HTTPS mock stands in for the Athena service, so no AWS account and no network ac
 com.example.athenachurn
 ├── mock/        MockAthenaServer — local HTTPS stand-in for the Athena endpoints
 ├── datasource/  DataSource adapters that wire the scenarios into real Hikari pools
-├── streaming/   Finding 1: StreamingResponseStallRepro, MidFlightCloseRepro (+ its DriverFaithfulAthenaSetup), both workaround repros
+├── streaming/   Finding 1: StreamingResponseStallRepro, TimeoutInterruptRepro, HealthCheckSoakRepro
 └── churn/       Finding 2: AthenaClientChurnRepro
 ```
 
@@ -64,14 +64,15 @@ waiting for in-flight requests — and the driver offers no way to abort an in-f
 response is delivered to completion no matter what the JDBC consumer does).
 
 So the real-world trigger is a close racing an in-flight stream. HikariCP never closes a borrowed
-connection, but the JDBC-level lifecycle routinely ends before the HTTP stream does — a
-response completes after the owning connection closed. Candidate sources include the paginator
-prefetching a page the consumer never reads, an error path abandoning a statement mid-stream, and
-a connection retired by max-lifetime immediately on return to the pool. (Plain early truncation
-by the consumer is not enough on its own where the query layer materializes the full result set
-before closing, as jOOQ's fetch() does.) When the late response bytes then arrive, the completion is rejected by
-the shut-down pool, the SDK falls back to synchronous completion, and the driver's blocking parse
-lands on the event loop — permanently.
+connection, but it does close one on return when `maxLifetime` expired during the borrow — and a
+health probe that waits 30 s on a slow query is exactly such a borrow. The soak below shows the
+full sequence on the real stack, and production data matched it: a probe times out, its thread is
+interrupted, the connection comes back and HikariCP closes it in the same millisecond
+(`Closing connection ...: (connection was evicted)`). That close shuts the completion executor,
+while the abandoned statement's poll → fetch chain is still running on a client the driver had
+already detached (Finding 2), so `close()` never reached it. When that chain's response arrives,
+the completion is rejected by the shut-down pool, the SDK falls back to synchronous completion, and
+the driver's blocking parse lands on the event loop — permanently.
 
 The blast radius is process-wide because the event loops are shared. The driver never sets an
 event-loop group on its `NettyNioAsyncHttpClient` builder, so every SDK client in the JVM draws
@@ -79,11 +80,14 @@ from the SDK's shared, reference-counted group (`SharedSdkEventLoopGroup`). One 
 thread therefore starves requests from every connection and every pool, which is why fresh
 connection attempts hang on the same wedged loop instead of escaping to a new one.
 
-### Reproduction
+### Reproduction (mechanism level)
 
 ```bash
 ./gradlew run
 ```
+
+This is the unit-level demonstration that the parser blocks the completing thread; it forces the
+inline completion rather than reaching it. The production path is in the two sections after it.
 
 `StreamingResponseStallRepro` builds a single-threaded Netty event-loop group, points an Athena
 streaming client at a local HTTPS mock, and starts a
@@ -119,55 +123,10 @@ This is the same failure shape production reported: `SQLTransientConnectionExcep
 `total=0, active=0, idle=0, waiting=0`, and a Netty event-loop thread blocked in
 `BufferedReader.readLine` inside the driver's own parser frame.
 
-### End-to-end reproduction: the same wedge through the SDK's own rejection fallback
-
-```bash
-./gradlew runMidFlightClose
-```
-
-`MidFlightCloseRepro` removes the one shortcut in the scenario above. It does not inject
-`Runnable::run`; it builds the exact completion executor the driver builds
-(`ConnectionConfiguration#createExecutor`), registers it as `FUTURE_COMPLETION_EXECUTOR`, and
-reaches the inline completion the way production does. It runs the same slow response twice:
-
-- **Benign run (`slowResponseWithExecutorAliveRecovers`) — slow response, executor alive.** The mock holds the streaming response before the
-  first header byte (a query that takes a long time to return its first result byte). The caller
-  blocks in a timeout-less `get()` throughout. When the bytes arrive, the completion hops onto an
-  `athena-jdbc-*` thread, the blocking parse runs there, and the call completes. A second request
-  on the same event loop succeeds. A slow response alone recovers.
-- **Lethal run (`slowResponseWithMidFlightCloseWedgesForever`) — the same slow response, executor shut down mid-flight.** While the response is
-  still held, the repro calls `shutdown()` on the completion executor — what
-  `ConnectionConfiguration.close()` does when the connection that issued the request is closed
-  with the request outstanding. When the response then arrives, the SDK logs its fallback line
-  and completes the future on the event loop, where the parse blocks forever. The repro asserts
-  the fallback frame (`MakeAsyncHttpRequestStage.lambda$executeHttpRequest$6`) is on the wedged
-  stack, shows a second request never completing, and reproduces the same
-  `total=0, active=0, idle=0, waiting=0` Hikari exception.
-
-Real output from the lethal run:
-
-```
-[aws-java-sdk-NettyEventLoop-repro-0] DEBUG software.amazon.awssdk...MakeAsyncHttpRequestStage - Could not complete the service call future on the provided FUTURE_COMPLETION_EXECUTOR. The future will be completed synchronously by thread aws-java-sdk-NettyEventLoop-repro-0. ...
-Thread "aws-java-sdk-NettyEventLoop-repro-0" (state=WAITING):
-    ...
-    at java.base/java.io.BufferedReader.readLine(BufferedReader.java:436)
-    at app//com.amazon.athena.client.results.parsing.GetQueryResultsStreamResponseParser.parse(GetQueryResultsStreamResponseParser.java:39)
-    ...
-    at app//software.amazon.awssdk.core.internal.http.pipeline.stages.MakeAsyncHttpRequestStage.lambda$executeHttpRequest$6(MakeAsyncHttpRequestStage.java:187)
-    ...
-    at app//io.netty.channel.nio.NioEventLoop.run(NioEventLoop.java:562)
-A second request on the same event loop never completes. WEDGED.
-```
-
-The two runs differ by a single call: `completionExecutor.shutdown()` while the response was in
-flight. A slow response is the precondition; the mid-flight close is what turns it into a
-permanent wedge.
-
 ### Production-shaped reproduction: no hand-rolled `shutdown()` (`runTimeoutInterrupt`)
 
-`MidFlightCloseRepro` proves the driver-side fallback is lethal, but it reaches the lethal state by
-calling `shutdown()` on the completion executor itself. This scenario reaches it the way production
-does, on the real stack: HikariCP 7.1.0 pool of real driver connections, jOOQ 3.21.6 `fetch`, and
+`StreamingResponseStallRepro` shows the parser blocks whichever thread completes the future. This
+scenario shows how production gets that thread to be the event loop, on the real stack: HikariCP 7.1.0 pool of real driver connections, jOOQ 3.21.6 `fetch`, and
 Reactor 3.8.7 `Mono.fromCallable(..).subscribeOn(boundedElastic()).timeout(T, fallback)` — the
 exact shape of the Develocity mcp-server Athena health probe. The mock keeps the query RUNNING past
 the timeout and flips it to SUCCEEDED on command.
@@ -323,10 +282,10 @@ Pinning `NetworkTimeoutMillis` to the pool's validation timeout holds that at 1 
 all 40 borrows. `glueSdkClient` stays at 0 throughout because nothing in this repro calls a Glue
 operation, so it is never lazily created either way.
 
-## Workarounds
+## Workaround and fix check
 
-Both workarounds below address **Finding 1**. Neither one is a fix in the driver; both are
-things a caller of the driver can do today.
+The workaround below addresses **Finding 1** from the caller's side. It is not a fix in the
+driver; it is what a caller of the driver can do today, and it is what Develocity shipped.
 
 ### Workaround A: `ResultFetcher=GetQueryResults` (configuration only)
 
@@ -383,76 +342,29 @@ actually called `AmazonAthena.GetQueryResults`, never `GetQueryResultsStream` (c
 cheapest workaround: one connection property, no code changes, no dependency on driver
 internals.
 
-### Workaround B: reflection executor hop (code only, fragile)
-
-Where Workaround A is not usable — for example, a caller specifically wants the streaming
-fetcher's lower per-row overhead — the same "the attached `thenApply` runs on whichever thread
-completes the future" mechanism that causes the bug can be used to fix it, entirely from calling
-code, with the driver jar untouched on disk. The fix is exactly the one-word change the driver
-itself needs (`thenApplyAsync` instead of `thenApply`), applied from the outside by intercepting
-the future the driver attaches its `thenApply` to.
-
-`ReflectionExecutorHopRepro`:
-
-1. Builds a real `AthenaConnection` through the driver's own public
-   `ConnectionConfiguration.from(...)` + `new AthenaConnection(configuration)` path (the same path
-   `AthenaDriver.connect(...)` uses internally), pooled behind HikariCP.
-2. Unwraps the pooled connection to `AthenaConnection` and reflects into its private
-   `configuration` field.
-3. Calls `configuration.getAthenaStreamingClient()` once, to force the real
-   `AthenaStreamingAsyncClient` to be lazily built and cached.
-4. Wraps that real client in a `java.lang.reflect.Proxy` that delegates every method to it
-   unchanged, except `getQueryResultsStream`: for that method, instead of returning the SDK's own
-   future, it returns a bridge future that is completed via
-   `real.whenCompleteAsync((result, throwable) -> ..., dedicatedExecutor)`. Because the driver's
-   `thenApply` is attached to the bridge future before the bridge future is completed (attachment
-   happens synchronously right after the call returns, long before any network response arrives),
-   that plain `thenApply` runs on whichever thread completes its future — and now that thread is
-   `dedicatedExecutor`'s worker thread, not the Netty event loop.
-5. Reflectively replaces the private `ConnectionConfiguration.athenaStreamingClient` field with
-   this proxy.
-
-```bash
-./gradlew runReflectionExecutorHop
-```
-
-Real output:
-
-```
-Forced lazy creation of the real AthenaStreamingAsyncClient: class software.amazon.awssdk.services.athenastreaming.DefaultAthenaStreamingAsyncClient
-Replaced ConnectionConfiguration.athenaStreamingClient with an executor-hop proxy in front of the real client.
-Parser thread: "athena-workaround-parse-executor-0"
-(1) The blocking parse now runs on the dedicated executor thread, not on any aws-java-sdk-NettyEventLoop thread.
-(2) A concurrent GetQueryExecution call on this connection's own AthenaAsyncClient completed (GetQueryExecutionResponse) while GetQueryResultsStream was still mid-body stalled.
-(3) Hikari re-borrowed this connection in 0ms while the streaming fetch was still stalled. The pool never reported total=0.
-```
-
-The parse thread is now the dedicated executor's worker thread, confirmed by name, and never the
-Netty event loop. This connection's own `AthenaAsyncClient` (the one used for
-`StartQueryExecution` / `GetQueryExecution`) kept completing calls, and HikariCP could still
-re-borrow the same connection, while the streaming fetch stayed mid-body stalled the whole time.
-
-**Caveat.** This workaround shares its dependency with Finding 2: `ConnectionConfiguration
-#setApiRequestTimeout` discards and lazily rebuilds `athenaStreamingClient` (among the other four
-client fields) whenever the driver's reported network timeout changes, and HikariCP triggers that
-on every validating borrow via `setNetworkTimeout`. Once that happens, `athenaStreamingClient` is
-a fresh, un-patched client again, and the proxy is gone. In real use this workaround needs one of:
-
-- re-apply the proxy after every validation cycle (fragile, timing-sensitive), or
-- combine it with Finding 2's own workaround — pin `NetworkTimeoutMillis` to the pool's
-  validation timeout — so the field is never invalidated in the first place.
-
-It also depends on the driver's private field layout (`AthenaConnection.configuration`,
-`ConnectionConfiguration.athenaStreamingClient`) and will break silently — falling back to the
-unpatched, event-loop-blocking behavior with no error — on any driver upgrade that renames or
-restructures those fields. Workaround A has none of these problems and should be preferred
-wherever it is usable.
-
 ## Expected driver behavior
 
-The proper fix belongs in the driver, not in caller-side workarounds. It is a one-word change,
-demonstrated by Workaround B: `GetQueryResultsStreamQueryResultsFactory` should attach its parse
-continuation with `thenApplyAsync(...)` (on a dedicated executor) instead of `thenApply(...)`, so
-a blocking parse of a streamed response can never run on a Netty event-loop thread. Independently
-of that, any timeout or cancellation path should close the streamed HTTP response rather than
-leaving it, and the connection along with it, open indefinitely.
+Three changes in the driver would each break the chain on their own; together they close it.
+
+1. **Parse off the event loop.** `GetQueryResultsStreamQueryResultsFactory` attaches its blocking
+   parse with `thenApply(...)`, so it runs on whichever thread completes the response future. It
+   should use `thenApplyAsync(...)` on a live executor, with a safe fallback when that executor is
+   gone: fail the future, never block the completing thread. `StreamingResponseStallRepro` is the
+   unit-level target for this.
+2. **Close what you detach.** `ConnectionConfiguration.setApiRequestTimeout` nulls the five SDK
+   clients without closing them, so a request in flight on an old client outlives
+   `ConnectionConfiguration.close()`, which only closes the clients it still references. Either
+   close the old clients or keep referencing them until they are idle. `AthenaClientChurnRepro`
+   measures this; phase G of `TimeoutInterruptRepro` shows the wedge needs it.
+3. **Give an abandoned statement a way to stop.** After the caller's thread is interrupted, the
+   statement's poll → fetch chain keeps running and issues `GetQueryResultsStream` for a result
+   nobody will read. `AsyncQueryResults` has no close or abort, and `Statement.close()` only
+   reaches `StopQueryExecution` while the statement is still marked executing. Cancel the chain
+   when the statement is closed or its thread interrupted, and close the streamed HTTP response
+   instead of leaving it open.
+
+The production sequence that needs all three is in the soak section above: a caller-side timeout
+interrupts the thread; the abandoned chain keeps polling on a client the driver has already
+detached; HikariCP closes the connection on return because `maxLifetime` expired during the
+borrow; the detached client's response then completes on the Netty event loop and the parse parks
+it. `HealthCheckSoakTest` fails when that happens and prints the HikariCP close lines that led to it.

@@ -105,24 +105,6 @@ tasks.register('runResultFetcherWorkaround', JavaExec) {
     dependsOn(downloadAthenaJdbc)
 }
 
-tasks.register('runReflectionExecutorHop', JavaExec) {
-    javaLauncher = javaToolchains.launcherFor(java.toolchain)
-    description = 'Runs the reflection executor-hop workaround scenario (Workaround B).'
-    group = 'application'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'com.example.athenachurn.streaming.ReflectionExecutorHopRepro'
-    dependsOn(downloadAthenaJdbc)
-}
-
-tasks.register('runMidFlightClose', JavaExec) {
-    javaLauncher = javaToolchains.launcherFor(java.toolchain)
-    description = 'Runs the two-phase slow-response scenario: benign recovery vs mid-flight executor shutdown wedge.'
-    group = 'application'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'com.example.athenachurn.streaming.MidFlightCloseRepro'
-    dependsOn(downloadAthenaJdbc)
-}
-
 tasks.register('runTimeoutInterrupt', JavaExec) {
     javaLauncher = javaToolchains.launcherFor(java.toolchain)
     description = 'Runs the production-shaped onset: Reactor timeout interrupts a jOOQ/Hikari Athena fetch while the query is still RUNNING; sweeps how late the query completes.'

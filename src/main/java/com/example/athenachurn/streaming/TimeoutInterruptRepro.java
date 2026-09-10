@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@code Mono.fromCallable(..).subscribeOn(boundedElastic()).timeout(T, fallback)} around it.
  * That is the exact shape of the Develocity mcp-server Athena connectivity health probe.
  *
- * <p>Unlike {@link MidFlightCloseRepro}, nothing here calls {@code shutdown()} by hand. The mock
+ * <p>Nothing here calls {@code shutdown()} by hand. The mock
  * keeps the query in state RUNNING past the timeout, then flips it to SUCCEEDED a configurable
  * delay later. Production data (Athena query history plus health-transition logs) shows one wedge
  * where the query completed 0.42 s after the timeout fired, and six recoveries where it completed
