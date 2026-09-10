@@ -226,8 +226,14 @@ seconds later that poll completes with no executor to hop to, so it runs on the 
 (`[NettyEventLoop-2-1] ... has state SUCCEEDED`), fetches the stream from there, and the blocking
 parse parks the loop.
 
-This is why production closes were always within a second of a probe timeout (5 of 6 in the Athena
-history): the close *is* the probe's return. A long borrow is exactly when a lifetime expiry gets
+The close comes in two flavours, both `maxLifetime`. If the lifetime expired *during* the borrow,
+HikariCP closes the connection on return, in the same millisecond as the timeout:
+`(connection was evicted)`. If it expires a few seconds *after* the return, while the abandoned
+chain is still polling, the housekeeper closes it idle: `(connection has passed maxLifetime)`. The
+test has produced both. Either way the orphan's connection loses its executor while its request is
+in flight. This is why production closes were within a second of a probe timeout (5 of 6 in the
+Athena history): the close is the probe's connection reaching the end of its 30-minute life during,
+or right after, the one borrow that lasted 30 seconds. A long borrow is exactly when a lifetime expiry gets
 caught in use. The remaining open number is how often a 30-minute lifetime lands inside a 30-second
 borrow at production traffic; HikariCP DEBUG on a production pod (`Closing connection ...:
 (connection was evicted)` right after `probe exceeded PT30S`) settles it directly.
