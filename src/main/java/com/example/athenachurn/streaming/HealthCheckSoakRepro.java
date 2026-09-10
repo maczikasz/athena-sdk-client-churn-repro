@@ -45,6 +45,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class HealthCheckSoakRepro {
 
+    /** What one soak run observed. {@code wedged} is the assertion the test makes. */
+    public record Result(boolean wedged, String wedgeDetail, int probes, int timeouts, int toolQueries, int toolFailures,
+                         int slowQueries, int slowApiCalls, String poolState) {
+        public String summary() {
+            return "probes=" + probes + " timeouts=" + timeouts + " tool ok/fail=" + toolQueries + "/" + toolFailures
+                + " slow-queries=" + slowQueries + " slow-api=" + slowApiCalls + " wedged=" + wedged + " " + poolState;
+        }
+    }
+
+
     private static final String PROBE_1 = "select 1 one from (values(1))";
     private static final String PROBE_2 = "SELECT id FROM build WHERE build_start_date = current_date - interval '1' day"
         + " AND build_start_time = '000000' LIMIT 1";
@@ -53,7 +63,15 @@ public final class HealthCheckSoakRepro {
     }
 
     public static void main(String[] args) throws Exception {
-        Duration runFor = Duration.ofSeconds(Long.getLong("soak.seconds", 600));
+        Result result = run(Duration.ofSeconds(Long.getLong("soak.seconds", 600)));
+        System.out.println(ts() + " SUMMARY " + result.summary());
+    }
+
+    /**
+     * Runs the soak for {@code runFor} (or until a wedge is detected) with the remaining settings
+     * taken from {@code soak.*} system properties. Used by {@code main} and by the JUnit test.
+     */
+    public static Result run(Duration runFor) throws Exception {
         Duration probeTimeout = Duration.ofSeconds(Long.getLong("soak.probeTimeoutSeconds", 10));
         Duration passInterval = Duration.ofSeconds(Long.getLong("soak.passIntervalSeconds", 20));
         Duration failureInterval = Duration.ofSeconds(Long.getLong("soak.failureIntervalSeconds", 5));
@@ -129,6 +147,7 @@ public final class HealthCheckSoakRepro {
             Instant end = Instant.now().plus(runFor);
             Instant lastReport = Instant.now();
             boolean wedged = false;
+            String wedgeDetail = "";
             while (Instant.now().isBefore(end)) {
                 Thread.sleep(1_000);
                 List<String> parked = eventLoopThreadsInParser();
@@ -136,7 +155,8 @@ public final class HealthCheckSoakRepro {
                     wedged = true;
                     System.out.println(ts() + " *** WEDGE DETECTED *** event-loop thread parked in the streaming parser:");
                     parked.forEach(l -> System.out.println("    " + l));
-                    System.out.println("    " + poolState(pool) + "  (look for the 'Closed connection' DEBUG line just before this)");
+                    System.out.println("    " + poolState(pool) + "  (look for the 'Closing connection' DEBUG line just before this)");
+                    wedgeDetail = ts() + " " + String.join("; ", parked) + " " + poolState(pool);
                 }
                 if (Duration.between(lastReport, Instant.now()).getSeconds() >= 60) {
                     lastReport = Instant.now();
@@ -149,10 +169,9 @@ public final class HealthCheckSoakRepro {
                 }
             }
             tools.forEach(Thread::interrupt);
-            System.out.println(ts() + " SUMMARY probes=" + probes + " timeouts=" + timeouts + " tool ok/fail=" + toolQueries + "/" + toolFailures
-                + " slow-queries=" + mock.slowQueriesInjected() + " slow-api=" + mock.slowApiCallsInjected() + " stops="
-                + mock.stopQueryExecutionCount() + " wedged=" + wedged + " " + poolState(pool));
             scheduler.shutdownNow();
+            return new Result(wedged, wedgeDetail, probes.get(), timeouts.get(), toolQueries.get(), toolFailures.get(),
+                mock.slowQueriesInjected(), mock.slowApiCallsInjected(), poolState(pool));
         }
     }
 

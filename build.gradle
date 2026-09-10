@@ -71,6 +71,21 @@ dependencies {
     implementation 'io.projectreactor:reactor-core:3.8.7'
     implementation 'org.jooq:jooq:3.21.6'
     implementation 'org.slf4j:slf4j-simple:2.0.16'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// HealthCheckSoakTest: the soak as a JUnit test that FAILS when the event loop wedges, so it can
+// be run with IntelliJ's "Repeat: Until Failure" or @RepeatedTest. Pass -Psoak.<name>=<value> as
+// for runSoak. ActiveProcessorCount=1 gives the production pod's two-loop SDK group.
+tasks.named('test', Test) {
+    useJUnitPlatform()
+    failFast = true // @RepeatedTest stops at the first wedge, like IntelliJ's Repeat: Until Failure
+    javaLauncher = javaToolchains.launcherFor(java.toolchain)
+    jvmArgs '-XX:ActiveProcessorCount=1'
+    project.properties.findAll { it.key.startsWith('soak.') }.each { k, v -> systemProperty k, v }
+    testLogging { events 'passed', 'failed'; exceptionFormat 'full'; showStandardStreams = false }
+    outputs.upToDateWhen { false }
 }
 
 application {
