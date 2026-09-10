@@ -66,7 +66,7 @@ compileJava.dependsOn(downloadAthenaJdbc)
 dependencies {
     implementation fileTree(dir: "libs/athena-jdbc-${athenaJdbcVersion}", include: ['*.jar', 'runtime-dependencies/*.jar'])
     implementation 'com.zaxxer:HikariCP:7.1.0'
-    // Same versions Develocity mcp-server ships: the health probe is a Reactor Mono.timeout over a
+    // Same versions the affected application ships: the health probe is a Reactor Mono.timeout over a
     // jOOQ fetch, so the scenario needs the real cancellation and close semantics of both.
     implementation 'io.projectreactor:reactor-core:3.8.7'
     implementation 'org.jooq:jooq:3.21.6'
@@ -77,7 +77,7 @@ dependencies {
 
 // HealthCheckSoakTest: the soak as a JUnit test that FAILS when the event loop wedges, so it can
 // be run with IntelliJ's "Repeat: Until Failure" or @RepeatedTest. Pass -Psoak.<name>=<value> as
-// for runSoak. ActiveProcessorCount=1 gives the production pod's two-loop SDK group.
+// for runSoak. ActiveProcessorCount=1 gives the production process's two-loop SDK group.
 tasks.named('test', Test) {
     useJUnitPlatform()
     failFast = true // @RepeatedTest stops at the first wedge, like IntelliJ's Repeat: Until Failure
@@ -125,12 +125,12 @@ tasks.register('runTimeoutInterrupt', JavaExec) {
 
 tasks.register('runSoak', JavaExec) {
     javaLauncher = javaToolchains.launcherFor(java.toolchain)
-    description = 'Soaks the mcp-server health probe on the incident-build pool config against a randomly slow mock Athena; Hikari at DEBUG logs every close reason.'
+    description = 'Soaks the health probe on the affected pool config against a randomly slow mock Athena; Hikari at DEBUG logs every close reason.'
     group = 'application'
     classpath = sourceSets.main.runtimeClasspath
     mainClass = 'com.example.athenachurn.soak.HealthCheckSoakRepro'
     dependsOn(downloadAthenaJdbc)
-    // The production pod had 2 event loops in the shared SDK group; 1 CPU gives the same shape.
+    // The production process had 2 event loops in the shared SDK group; 1 CPU gives the same shape.
     jvmArgs '-XX:ActiveProcessorCount=1'
     systemProperty 'org.slf4j.simpleLogger.log.com.zaxxer.hikari', 'debug'
     systemProperty 'org.slf4j.simpleLogger.showDateTime', 'true'

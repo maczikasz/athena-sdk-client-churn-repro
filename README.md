@@ -106,7 +106,7 @@ tries to borrow a connection. Real output from this repro:
 
 ```
 Reproduced the production-facing exception:
-java.sql.SQLTransientConnectionException: mcp-server-athena-write-pool-repro - Connection is not available, request timed out after 3004ms (total=0, active=0, idle=0, waiting=0)
+java.sql.SQLTransientConnectionException: athena-write-pool-repro - Connection is not available, request timed out after 3004ms (total=0, active=0, idle=0, waiting=0)
 
 Reproduced: GetQueryResultsStream parser blocks the sole Netty event loop.
 The server sent the whole response and closed it normally, but the parser is
@@ -129,7 +129,7 @@ This is the same failure shape production reported: `SQLTransientConnectionExcep
 `StreamingResponseStallRepro` shows the parser blocks whichever thread completes the future. This
 scenario shows how production gets that thread to be the event loop, on the real stack: HikariCP 7.1.0 pool of real driver connections, jOOQ 3.21.6 `fetch`, and
 Reactor 3.8.7 `Mono.fromCallable(..).subscribeOn(boundedElastic()).timeout(T, fallback)` — the
-exact shape of the Develocity mcp-server Athena health probe. The mock keeps the query RUNNING past
+exact shape of the affected application's Athena health probe. The mock keeps the query RUNNING past
 the timeout and flips it to SUCCEEDED on command.
 
     ./gradlew runTimeoutInterrupt                       # sweep + phases B, C, E, D, F in order
@@ -176,9 +176,9 @@ and then observed at runtime):
    close of the connection is required. Finding 2 is what makes that close lethal; it does not
    replace it.
 
-Production correlate (Develocity, apache instance, 2026-09-07): the probe timed out at 16:08:44.783 UTC;
-136 ms later another borrow validated a connection (the detachment step); the query reached SUCCEEDED
-at 16:08:45.202 and the pod never issued another Athena request. Which physical close ran on that
+Production correlate: the probe timed out; 136 ms later another borrow validated a connection (the
+detachment step); the query reached SUCCEEDED 0.42 s after the timeout and the process never issued
+another Athena request. Which physical close ran on that
 connection in production is not identified. The application has no eviction of its own, validation
 never exceeded its 15 s timeout, and `maxLifetime` rotation (8 h across 30 connections, one close
 per ~16 min) is far too rare to land inside sub-second windows three times in 25 timeouts. The
@@ -192,9 +192,9 @@ statement keeps issuing network requests with no way to stop it.
 
 ### Soak: the wedge from random Athena slowness alone (`runSoak`)
 
-The scenarios above force each step. This one forces nothing. It runs the mcp-server health probe
-(`AdaptiveHealthProbe` shape, probe queries verbatim) plus background tool queries against a mock
-Athena that is randomly slow, on the pool configuration Develocity shipped **before 2026-08-31** —
+The scenarios above force each step. This one forces nothing. It runs the application's health probe
+(same shape and probe queries as the real one) plus background tool queries against a mock
+Athena that is randomly slow, on the pool configuration the application shipped **before our fix** —
 the build the production incidents happened on:
 
 - `maxLifetime` 30 min (scaled to 40 s here), `connectionTimeout` 3 s, `validationTimeout` 15 s,
@@ -204,7 +204,7 @@ the build the production incidents happened on:
 - `ResultFetcher=GetQueryResultsStream`.
 
 HikariCP logs at DEBUG, so every close carries its reason. `-XX:ActiveProcessorCount=1` gives the
-production pod's two-loop SDK event-loop group.
+production process's two-loop SDK event-loop group.
 
     ./gradlew runSoak -Psoak.seconds=120 -Psoak.passIntervalSeconds=8 -Psoak.maxLifetimeSeconds=40
 
@@ -235,7 +235,7 @@ in flight. This is why production closes were within a second of a probe timeout
 Athena history): the close is the probe's connection reaching the end of its 30-minute life during,
 or right after, the one borrow that lasted 30 seconds. A long borrow is exactly when a lifetime expiry gets
 caught in use. The remaining open number is how often a 30-minute lifetime lands inside a 30-second
-borrow at production traffic; HikariCP DEBUG on a production pod (`Closing connection ...:
+borrow at production traffic; HikariCP DEBUG on a production process (`Closing connection ...:
 (connection was evicted)` right after `probe exceeded PT30S`) settles it directly.
 
 ## Finding 2: SDK client construction churn on every pool borrow
@@ -292,7 +292,7 @@ operation, so it is never lazily created either way.
 ## Workaround and fix check
 
 The workaround below addresses **Finding 1** from the caller's side. It is not a fix in the
-driver; it is what a caller of the driver can do today, and it is what Develocity shipped.
+driver; it is what a caller of the driver can do today, and it is what we shipped.
 
 ### Workaround A: `ResultFetcher=GetQueryResults` (configuration only)
 

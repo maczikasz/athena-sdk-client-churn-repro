@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * The production-shaped onset, end to end, on the real stack: HikariCP 7.1.0 pool of real
  * driver 3.8.0 connections, a jOOQ 3.21.6 {@code fetch}, and a Reactor 3.8.7
  * {@code Mono.fromCallable(..).subscribeOn(boundedElastic()).timeout(T, fallback)} around it.
- * That is the exact shape of the Develocity mcp-server Athena connectivity health probe.
+ * That is the exact shape of the affected application's Athena connectivity health probe.
  *
  * <p>Nothing here calls {@code shutdown()} by hand. The mock
  * keeps the query in state RUNNING past the timeout, then flips it to SUCCEEDED a configurable
@@ -385,7 +385,7 @@ public final class TimeoutInterruptRepro {
         AtomicReference<Throwable> workerFailure = new AtomicReference<>();
         long started = System.nanoTime();
 
-        // The AdaptiveHealthProbe shape, verbatim: blocking probe on boundedElastic, Mono.timeout
+        // The health probe shape, verbatim: blocking probe on boundedElastic, Mono.timeout
         // with a fallback value. On timeout Reactor cancels upstream, which interrupts the worker.
         String outcome = Mono.fromCallable(() -> {
                 workerThread.set(Thread.currentThread().getName());
@@ -454,7 +454,7 @@ public final class TimeoutInterruptRepro {
         return served && parked.isEmpty();
     }
 
-    // ---- wiring: mirrors AthenaJdbcSupport in Develocity, with the incident-time streaming fetcher
+    // ---- wiring: mirrors the application's pool factory, with the streaming fetcher it ran at the time
 
     private static HikariDataSource productionShapedPool(String mockBaseUrl) {
         return productionShapedPool(mockBaseUrl, 15);
@@ -470,7 +470,7 @@ public final class TimeoutInterruptRepro {
         properties.put(ConnectionParameters.CREDENTIALS_PROVIDER_PARAMETER.name(), "Static");
         properties.put(ConnectionParameters.USER_PARAMETER.name(), "dummy");
         properties.put(ConnectionParameters.PASSWORD_PARAMETER.name(), "dummy-secret");
-        // The fetcher that was in production at incident time.
+        // The fetcher that was in production at the time.
         properties.put(ConnectionParameters.RESULT_FETCHER.name(), "GetQueryResultsStream");
         properties.put(ConnectionParameters.NETWORK_TIMEOUT_MILLIS.name(), "15000");
 
@@ -478,7 +478,7 @@ public final class TimeoutInterruptRepro {
         config.setJdbcUrl("jdbc:athena://");
         config.setDriverClassName(AthenaDriver.class.getName());
         config.setDataSourceProperties(properties);
-        config.setPoolName("mcp-server-athena-pool-" + maxPoolSize);
+        config.setPoolName("athena-pool-" + maxPoolSize);
         config.setMaximumPoolSize(maxPoolSize);
         config.setConnectionTimeout(Duration.ofSeconds(30).toMillis());
         config.setValidationTimeout(Duration.ofSeconds(15).toMillis());

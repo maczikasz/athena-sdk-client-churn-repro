@@ -8,7 +8,7 @@ import java.time.Instant;
 /**
  * The scenario. Everything else in this package is wiring; this class is the story.
  *
- * <p>A Develocity mcp-server pod, on the pool configuration it shipped with before 2026-08-31,
+ * <p>An application process, on the pool configuration it shipped with before our fix,
  * runs its Athena health probe every few seconds and serves tool queries in the background,
  * against an Athena that is sometimes slow. Nothing is forced. The question is whether the shared
  * Netty event loop wedges, and if it does, which HikariCP close preceded it.
@@ -21,7 +21,7 @@ public final class HealthCheckSoak {
     public static SoakResult run(SoakSettings settings) throws Exception {
         Timeline timeline = new Timeline();
         try (MockAthenaServer athena = MockAthenaServer.startOnRandomPort();
-             IncidentBuildAthenaPool pool = IncidentBuildAthenaPool.start(athena.baseUrl(), settings.maxLifetime())) {
+             AffectedAthenaPool pool = AffectedAthenaPool.start(athena.baseUrl(), settings.maxLifetime())) {
 
             athena.enableSoakMode(settings.slowQueryProbability(), settings.slowQueryMin().toMillis(),
                 settings.slowQueryMax().toMillis(), settings.slowApiCallProbability(), settings.slowApiCall().toMillis());

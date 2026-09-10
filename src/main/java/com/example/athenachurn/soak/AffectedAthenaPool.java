@@ -15,16 +15,16 @@ import java.time.Duration;
 import java.util.Properties;
 
 /**
- * The mcp-server Athena pool exactly as Develocity configured it before dv commit b47971c
- * (2026-08-31), the build the production incidents happened on. Four of these settings are what
+ * The application's Athena pool exactly as configured before our fix, the build the production
+ * incidents happened on. Four of these settings are what
  * make the wedge reachable; each is called out below.
  */
-public final class IncidentBuildAthenaPool implements AutoCloseable {
+public final class AffectedAthenaPool implements AutoCloseable {
 
     private final HikariDataSource dataSource;
     private final DSLContext dsl;
 
-    private IncidentBuildAthenaPool(HikariDataSource dataSource) {
+    private AffectedAthenaPool(HikariDataSource dataSource) {
         this.dataSource = dataSource;
         DefaultConfiguration configuration = new DefaultConfiguration();
         configuration.set(SQLDialect.DEFAULT);
@@ -33,7 +33,7 @@ public final class IncidentBuildAthenaPool implements AutoCloseable {
         this.dsl = DSL.using(configuration);
     }
 
-    public static IncidentBuildAthenaPool start(String athenaEndpoint, Duration maxLifetime) {
+    public static AffectedAthenaPool start(String athenaEndpoint, Duration maxLifetime) {
         Properties driver = new Properties();
         driver.put(ConnectionParameters.ATHENA_ENDPOINT_PARAMETER.name(), athenaEndpoint);
         driver.put(ConnectionParameters.ATHENA_STREAMING_ENDPOINT_PARAMETER.name(), athenaEndpoint);
@@ -53,7 +53,7 @@ public final class IncidentBuildAthenaPool implements AutoCloseable {
         hikari.setJdbcUrl("jdbc:athena://");
         hikari.setDriverClassName(AthenaDriver.class.getName());
         hikari.setDataSourceProperties(driver);
-        hikari.setPoolName("mcp-server-athena-pool");
+        hikari.setPoolName("athena-pool");
         hikari.setMaximumPoolSize(15);
         // (3) maxLifetime 30 min in production. A connection whose lifetime expires while borrowed
         //     is closed on return - and a probe waiting 30 s on a slow query is a long borrow.
@@ -64,7 +64,7 @@ public final class IncidentBuildAthenaPool implements AutoCloseable {
         hikari.setValidationTimeout(Duration.ofSeconds(15).toMillis());
         hikari.setConnectionInitSql("select 1");
         hikari.setRegisterMbeans(true);
-        return new IncidentBuildAthenaPool(new HikariDataSource(hikari));
+        return new AffectedAthenaPool(new HikariDataSource(hikari));
     }
 
     public DSLContext dsl() {

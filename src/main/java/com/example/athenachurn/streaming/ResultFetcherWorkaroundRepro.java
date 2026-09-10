@@ -115,7 +115,7 @@ public final class ResultFetcherWorkaroundRepro {
             SucceedingAthenaDataSource succeedingDataSource = new SucceedingAthenaDataSource(athenaClient);
             HikariConfig hikariConfig = new HikariConfig();
             hikariConfig.setDataSource(succeedingDataSource);
-            hikariConfig.setPoolName("mcp-server-athena-write-pool-workaround");
+            hikariConfig.setPoolName("athena-write-pool-workaround");
             hikariConfig.setMaximumPoolSize(1);
             hikariConfig.setConnectionTimeout(3_000);
             hikariConfig.setInitializationFailTimeout(-1);

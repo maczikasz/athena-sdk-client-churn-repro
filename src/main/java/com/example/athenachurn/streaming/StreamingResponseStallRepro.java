@@ -83,7 +83,7 @@ public final class StreamingResponseStallRepro {
             BlockingAthenaDataSource blockingDataSource = new BlockingAthenaDataSource(athenaClient);
             HikariConfig hikariConfig = new HikariConfig();
             hikariConfig.setDataSource(blockingDataSource);
-            hikariConfig.setPoolName("mcp-server-athena-write-pool-repro");
+            hikariConfig.setPoolName("athena-write-pool-repro");
             hikariConfig.setMaximumPoolSize(1);
             hikariConfig.setConnectionTimeout(3_000);
             hikariConfig.setInitializationFailTimeout(-1);

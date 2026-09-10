@@ -51,7 +51,7 @@ public final class SoakLog {
             return lines.stream()
                 .filter(l -> l.contains("Closing connection") || l.contains("onErrorDropped") || l.contains("NettyEventLoop"))
                 .skip(Math.max(0, lines.size() - 400))
-                .map(l -> l.replaceAll(" (DEBUG|INFO|WARN|ERROR) [a-zA-Z.]+ - ", " ").replace("mcp-server-athena-pool - ", ""))
+                .map(l -> l.replaceAll(" (DEBUG|INFO|WARN|ERROR) [a-zA-Z.]+ - ", " ").replace("athena-pool - ", ""))
                 .map(l -> l.length() > 200 ? l.substring(0, 200) : l)
                 .collect(Collectors.joining("\n"));
         } catch (IOException e) {

@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 /**
- * The mcp-server Athena connectivity probe, same shape as {@code AdaptiveHealthProbe}: a blocking
+ * The application's Athena connectivity probe, same shape as the real one: a blocking
  * jOOQ fetch on {@code boundedElastic}, wrapped in {@code Mono.timeout} with a DOWN fallback, and
  * rescheduled after each run - a long interval while UP, a short one while DOWN.
  *

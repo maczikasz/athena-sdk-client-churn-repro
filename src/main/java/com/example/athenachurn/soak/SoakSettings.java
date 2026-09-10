@@ -11,7 +11,7 @@ public record SoakSettings(
     Duration probeTimeout,          // production PT30S
     Duration probePassInterval,     // production PT5M
     Duration probeFailureInterval,  // production PT30S
-    Duration maxLifetime,           // incident build: 30 min
+    Duration maxLifetime,           // affected build: 30 min
     double slowQueryProbability,
     Duration slowQueryMin,
     Duration slowQueryMax,

@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class ToolTraffic {
 
     private static final String TOOL_QUERY =
-        "select drv_chunk_id chunk_id, COUNT(*) count from build where build_start_date = current_date";
+        "select COUNT(*) count from build where build_start_date = current_date";
 
     private final List<Thread> threads = new ArrayList<>();
     private final AtomicInteger succeeded = new AtomicInteger();
