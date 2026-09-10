@@ -15,7 +15,8 @@ HTTPS mock stands in for the Athena service, so no AWS account and no network ac
 com.example.athenachurn
 ├── mock/        MockAthenaServer — local HTTPS stand-in for the Athena endpoints
 ├── datasource/  DataSource adapters that wire the scenarios into real Hikari pools
-├── streaming/   Finding 1: StreamingResponseStallRepro, TimeoutInterruptRepro, HealthCheckSoakRepro
+├── streaming/   Finding 1: StreamingResponseStallRepro, TimeoutInterruptRepro
+├── soak/        The production sequence end to end: HealthCheckSoak (read this one first)
 └── churn/       Finding 2: AthenaClientChurnRepro
 ```
 
@@ -367,4 +368,5 @@ The production sequence that needs all three is in the soak section above: a cal
 interrupts the thread; the abandoned chain keeps polling on a client the driver has already
 detached; HikariCP closes the connection on return because `maxLifetime` expired during the
 borrow; the detached client's response then completes on the Netty event loop and the parse parks
-it. `HealthCheckSoakTest` fails when that happens and prints the HikariCP close lines that led to it.
+it. `HealthCheckSoakTest` fails when that happens and prints the timeline and the HikariCP close lines that led to it.
+`HealthCheckSoak` is the scenario in ~40 lines; the other classes in `soak/` are its wiring.
