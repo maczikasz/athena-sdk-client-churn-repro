@@ -4,3 +4,14 @@ libs/
 .idea/
 *.iml
 out/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# Local agent tooling, not part of the reproduction.
+.claude/
+.mcp.json
+.ignore
+AGENTS.md
+opencode.json
+.DS_Store
