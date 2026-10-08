@@ -12,6 +12,15 @@ Reactor timeout. The only fake is Athena.
 Needs Java 21 (jOOQ 3.21). The tests run with `-XX:ActiveProcessorCount=1` so the SDK's shared
 event-loop group has two loops, like the affected production process.
 
+## Status on driver 3.8.1
+
+3.8.1 (released 2026-08-28) does not fix this. Its release notes list only a Netty bump, DataZone
+proxy support and GovCloud trusted-identity changes. `GetQueryResultsStreamQueryResultsFactory`
+still attaches the parser with `thenApply` over `toBlockingInputStream`, and
+`ConnectionConfiguration.close()` still shuts the executor unconditionally. `WedgeTest` wedges on
+3.8.1 at the same frame. To check a driver version yourself, change `athenaJdbcVersion` in
+`build.gradle` and run `./gradlew test --tests '*WedgeTest*'`: the test passes when the loop wedges.
+
 ## Project layout
 
 ```
