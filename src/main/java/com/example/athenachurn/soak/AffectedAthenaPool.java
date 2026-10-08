@@ -34,6 +34,10 @@ public final class AffectedAthenaPool implements AutoCloseable {
     }
 
     public static AffectedAthenaPool start(String athenaEndpoint, Duration maxLifetime) {
+        return start(athenaEndpoint, maxLifetime, 15);
+    }
+
+    public static AffectedAthenaPool start(String athenaEndpoint, Duration maxLifetime, int maxPoolSize) {
         Properties driver = new Properties();
         driver.put(ConnectionParameters.ATHENA_ENDPOINT_PARAMETER.name(), athenaEndpoint);
         driver.put(ConnectionParameters.ATHENA_STREAMING_ENDPOINT_PARAMETER.name(), athenaEndpoint);
@@ -54,7 +58,7 @@ public final class AffectedAthenaPool implements AutoCloseable {
         hikari.setDriverClassName(AthenaDriver.class.getName());
         hikari.setDataSourceProperties(driver);
         hikari.setPoolName("athena-pool");
-        hikari.setMaximumPoolSize(15);
+        hikari.setMaximumPoolSize(maxPoolSize);
         // (3) maxLifetime 30 min in production. A connection whose lifetime expires while borrowed
         //     is closed on return - and a probe waiting 30 s on a slow query is a long borrow.
         hikari.setMaxLifetime(maxLifetime.toMillis());
@@ -65,6 +69,10 @@ public final class AffectedAthenaPool implements AutoCloseable {
         hikari.setConnectionInitSql("select 1");
         hikari.setRegisterMbeans(true);
         return new AffectedAthenaPool(new HikariDataSource(hikari));
+    }
+
+    public HikariDataSource dataSource() {
+        return dataSource;
     }
 
     public DSLContext dsl() {

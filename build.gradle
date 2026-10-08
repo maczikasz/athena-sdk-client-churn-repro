@@ -89,38 +89,12 @@ tasks.named('test', Test) {
 }
 
 application {
-    mainClass = 'com.example.athenachurn.streaming.StreamingResponseStallRepro'
+    mainClass = 'com.example.athenachurn.soak.HealthCheckSoakRepro'
 }
 
 tasks.named('run') {
     dependsOn(downloadAthenaJdbc)
-}
-
-tasks.register('runResultFetcherWorkaround', JavaExec) {
-    javaLauncher = javaToolchains.launcherFor(java.toolchain)
-    description = 'Runs the ResultFetcher=GetQueryResults workaround scenario (Workaround A).'
-    group = 'application'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'com.example.athenachurn.streaming.ResultFetcherWorkaroundRepro'
-    dependsOn(downloadAthenaJdbc)
-}
-
-tasks.register('runTimeoutInterrupt', JavaExec) {
-    javaLauncher = javaToolchains.launcherFor(java.toolchain)
-    description = 'Runs the production-shaped onset: Reactor timeout interrupts a jOOQ/Hikari Athena fetch while the query is still RUNNING; sweeps how late the query completes.'
-    group = 'application'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'com.example.athenachurn.streaming.TimeoutInterruptRepro'
-    dependsOn(downloadAthenaJdbc)
-    if (project.hasProperty('completionDelaysMillis')) {
-        args project.property('completionDelaysMillis')
-    }
-    // -Pphases=C -Ptrials=5 runs only the eviction race, repeatedly, and stops at the first wedge.
-    ['phases', 'trials'].each { name ->
-        if (project.hasProperty(name)) {
-            systemProperty name, project.property(name)
-        }
-    }
+    jvmArgs '-XX:ActiveProcessorCount=1'
 }
 
 tasks.register('runSoak', JavaExec) {

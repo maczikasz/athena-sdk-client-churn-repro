@@ -37,12 +37,6 @@ public final class MockAthenaServer implements AutoCloseable {
     private static final String STREAMING_DATA_ROW = "{\"data\":[{\"varCharValue\":\"1\"}]}\n";
 
     private final HttpsServer server;
-    private final AtomicBoolean hangStreamingResponseOnce = new AtomicBoolean();
-    private volatile CountDownLatch streamingHangStarted;
-    private volatile CountDownLatch releaseStreamingResponse;
-    private final AtomicBoolean hangGetQueryResultsOnce = new AtomicBoolean();
-    private volatile CountDownLatch getQueryResultsHangStarted;
-    private volatile CountDownLatch releaseGetQueryResults;
     private final AtomicBoolean holdStreamingHeadersOnce = new AtomicBoolean();
     private volatile CountDownLatch streamingRequestArrived;
     private volatile CountDownLatch releaseStreamingHeaders;
@@ -89,20 +83,6 @@ public final class MockAthenaServer implements AutoCloseable {
         return "https://127.0.0.1:" + server.getAddress().getPort();
     }
 
-    public void armStreamingResponseHangOnce() {
-        hangStreamingResponseOnce.set(true);
-        streamingHangStarted = new CountDownLatch(1);
-        releaseStreamingResponse = new CountDownLatch(1);
-    }
-
-    public boolean awaitStreamingResponseHangStarted(long timeout, TimeUnit unit) throws InterruptedException {
-        return streamingHangStarted.await(timeout, unit);
-    }
-
-    public void releaseStreamingResponse() {
-        releaseStreamingResponse.countDown();
-    }
-
     /**
      * Arms a one-time hold of the streaming response BEFORE any header byte is sent. This models
      * Athena taking a long time to return the first byte of a result (a queued or slow query),
@@ -125,20 +105,6 @@ public final class MockAthenaServer implements AutoCloseable {
     }
 
     /** Arms a one-time mid-body stall on the buffered GetQueryResults response. */
-    public void armGetQueryResultsHangOnce() {
-        hangGetQueryResultsOnce.set(true);
-        getQueryResultsHangStarted = new CountDownLatch(1);
-        releaseGetQueryResults = new CountDownLatch(1);
-    }
-
-    public boolean awaitGetQueryResultsHangStarted(long timeout, TimeUnit unit) throws InterruptedException {
-        return getQueryResultsHangStarted.await(timeout, unit);
-    }
-
-    public void releaseGetQueryResults() {
-        releaseGetQueryResults.countDown();
-    }
-
     /**
      * Arms a hold on the query state: every GetQueryExecution answers RUNNING until
      * {@link #releaseQueryCompletion()} flips it to SUCCEEDED. The driver keeps polling and the
@@ -220,13 +186,9 @@ public final class MockAthenaServer implements AutoCloseable {
         String target = exchange.getRequestHeaders().getFirst("X-Amz-Target");
         requestedTargets.add(target);
         String body = soakMode ? new String(readAll(exchange.getRequestBody()), StandardCharsets.UTF_8) : "";
-        if (soakMode && !target.endsWith("GetQueryResults") && random.nextDouble() < slowApiCallProbability) {
+        if (soakMode && random.nextDouble() < slowApiCallProbability) {
             slowApiCallsInjected.incrementAndGet();
             sleep(slowApiCallMillis);
-        }
-        if (target.endsWith("GetQueryResults")) {
-            handleBufferedGetQueryResults(exchange);
-            return;
         }
 
         if (target.endsWith("StopQueryExecution")) {
@@ -296,40 +258,6 @@ public final class MockAthenaServer implements AutoCloseable {
         }
     }
 
-    /**
-     * AmazonAthena.GetQueryResults: the buffered, non-streaming result page API. Response body is
-     * one JSON document (not one-row-per-line like GetQueryResultsStream). To reproduce the same
-     * "mid-body stall" shape as the streaming scenario, this can send the response in two chunked
-     * writes with an artificial pause between them, holding the HTTP connection open with only
-     * part of the JSON document delivered.
-     */
-    private void handleBufferedGetQueryResults(HttpExchange exchange) throws IOException {
-        boolean hang = hangGetQueryResultsOnce.compareAndSet(true, false);
-
-        String columnInfo = "{\"CatalogName\":\"hive\",\"SchemaName\":\"\",\"TableName\":\"\","
-            + "\"Name\":\"one\",\"Label\":\"one\",\"Type\":\"integer\",\"Precision\":10,\"Scale\":0,"
-            + "\"Nullable\":\"UNKNOWN\",\"CaseSensitive\":false}";
-        String firstHalf = "{\"ResultSet\":{\"ResultSetMetadata\":{\"ColumnInfo\":[" + columnInfo + "]},"
-            + "\"Rows\":[";
-        String secondHalf = "{\"Data\":[{\"VarCharValue\":\"1\"}]}]},\"UpdateCount\":0}";
-
-        exchange.getResponseHeaders().set("Content-Type", "application/x-amz-json-1.1");
-        exchange.sendResponseHeaders(200, 0);
-        try (OutputStream output = exchange.getResponseBody()) {
-            output.write(firstHalf.getBytes(StandardCharsets.UTF_8));
-            output.flush();
-            if (hang) {
-                getQueryResultsHangStarted.countDown();
-                try {
-                    releaseGetQueryResults.await(HANG_MAX_MILLIS, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            output.write(secondHalf.getBytes(StandardCharsets.UTF_8));
-        }
-    }
-
     private void handleStreamingResults(HttpExchange exchange) throws IOException {
         boolean holdHeaders = holdStreamingHeadersOnce.compareAndSet(true, false);
         if (holdHeaders) {
@@ -340,26 +268,13 @@ public final class MockAthenaServer implements AutoCloseable {
                 Thread.currentThread().interrupt();
             }
         }
-        boolean hang = hangStreamingResponseOnce.compareAndSet(true, false);
-        if (hang) {
-            sleep(200);
-        }
 
         exchange.getResponseHeaders().set("Content-Type", "application/octet-stream");
         exchange.sendResponseHeaders(200, 0);
         try (OutputStream output = exchange.getResponseBody()) {
             output.write(STREAMING_METADATA.getBytes(StandardCharsets.UTF_8));
             output.flush();
-            if (hang) {
-                streamingHangStarted.countDown();
-                try {
-                    releaseStreamingResponse.await(HANG_MAX_MILLIS, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            } else {
-                output.write(STREAMING_DATA_ROW.getBytes(StandardCharsets.UTF_8));
-            }
+            output.write(STREAMING_DATA_ROW.getBytes(StandardCharsets.UTF_8));
         }
     }
 
